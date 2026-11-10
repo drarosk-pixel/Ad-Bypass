@@ -36,6 +36,15 @@ DESKTOP_UA = (
 
 _COUNTER_RE = re.compile(r'"counter_value"\s*:\s*(\d+)')
 
+# Minimal stealth: hide the most common automation tells so the site's JS
+# anti-bot check is less likely to show its "Reload Page" block.
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+"""
+
 # Cloudflare interstitial / challenge fingerprints.
 _CF_MARKERS = ("just a moment", "challenge-platform", "cf-chl", "cf_chl_opt")
 
@@ -195,6 +204,7 @@ class LinkResolver:
             locale="en-US",
             viewport={"width": 1280, "height": 800},
         )
+        await context.add_init_script(_STEALTH_JS)
         destinations: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
 
         async def on_response(resp: Response) -> None:
@@ -224,6 +234,7 @@ class LinkResolver:
             )
 
             await self._clear_cloudflare(page, log)
+            await self._pass_block_gate(page, log)
 
             if verbose:
                 await self._dump_page(page, log, "after-load")
@@ -321,6 +332,29 @@ class LinkResolver:
                 break
         if shown == 0:
             log("   (no clickable elements found)")
+
+    async def _pass_block_gate(self, page: Page, log) -> None:
+        """Some AroLinks visits land on an anti-bot block page that only has a
+        'Reload Page' button. Click/reload a few times to try to get past it."""
+        for attempt in range(3):
+            html = await self._content(page)
+            if "go-link" in html:
+                return
+            reload_btn = page.locator(".reload-btn, button:has-text('Reload')").first
+            try:
+                if await reload_btn.count():
+                    log(f"   block gate: clicking Reload (attempt {attempt + 1})")
+                    await reload_btn.click(timeout=3_000)
+                else:
+                    log(f"   block gate: reloading (attempt {attempt + 1})")
+                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
+            except PlaywrightError:
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
+                except PlaywrightError:
+                    pass
+            await page.wait_for_timeout(3_000)
+            await self._clear_cloudflare(page, log)
 
     async def _clear_cloudflare(self, page: Page, log) -> None:
         """Wait for the Cloudflare 'Just a moment' interstitial to pass."""
