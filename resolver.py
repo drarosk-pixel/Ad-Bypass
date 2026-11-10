@@ -189,11 +189,14 @@ class LinkResolver:
             log("2) techmint partner -> NOT FOUND on first page")
 
         # Final step — request the short link again with an onlinewish referer.
-        final_html, final_url, via = self._fetch_final_page(session, url, trace)
+        # IMPORTANT: keep using the SAME client (cloudscraper) for the follow-up
+        # POST, else /links/go lacks Cloudflare's cf_clearance cookie and returns
+        # a 403 "Just a moment" challenge.
+        final_html, final_url, via, client = self._fetch_final_page(session, url, trace)
         log(f"3) final GET ({via}) -> len={len(final_html)}")
         log(f"   title: {_page_title(final_html)}")
 
-        result = self._parse_final_page(final_html, final_url, session, trace, "final")
+        result = self._parse_final_page(final_html, final_url, client, trace, "final")
         if result is not None:
             return result
 
@@ -272,7 +275,7 @@ class LinkResolver:
 
     def _fetch_final_page(
         self, session: requests.Session, url: str, trace: _Trace | None
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, object]:
         headers = {"Referer": "https://onlinewish.in/", "User-Agent": DESKTOP_UA}
         try:
             scraper = cloudscraper.create_scraper(
@@ -285,7 +288,7 @@ class LinkResolver:
                     domain=cookie.domain or "arolinks.com",
                 )
             resp = scraper.get(url, headers=headers, timeout=30)
-            return resp.text, str(resp.url), "cloudscraper"
+            return resp.text, str(resp.url), "cloudscraper", scraper
         except Exception as exc:  # noqa: BLE001 - any cloudscraper failure -> fallback
             if trace is not None:
                 trace.add(
@@ -293,7 +296,7 @@ class LinkResolver:
                 )
             try:
                 resp = session.get(url, headers=headers, timeout=30)
-                return resp.text, str(resp.url), "requests-fallback"
+                return resp.text, str(resp.url), "requests-fallback", session
             except requests.RequestException as rexc:
                 raise ResolveError(
                     f"Final page fetch fail: {type(rexc).__name__}"
@@ -303,7 +306,7 @@ class LinkResolver:
         self,
         html: str,
         page_url: str,
-        session: requests.Session,
+        client: object,
         trace: _Trace | None,
         where: str,
     ) -> ResolveResult | None:
@@ -344,13 +347,14 @@ class LinkResolver:
             time.sleep(counter + 1)
 
         try:
-            r_go = session.post(
+            r_go = client.post(
                 action,
                 data=hidden,
                 headers={
                     "Referer": page_url,
+                    "Origin": "https://arolinks.com",
                     "X-Requested-With": "XMLHttpRequest",
-                    "User-Agent": DESKTOP_UA,
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
                 },
                 timeout=20,
             )
@@ -363,6 +367,11 @@ class LinkResolver:
         try:
             payload = json.loads(r_go.text)
         except (ValueError, TypeError):
+            if "just a moment" in r_go.text.lower():
+                raise ResolveError(
+                    "Cloudflare ne POST block kiya (cf_clearance missing). "
+                    "cloudscraper client POST ke liye use hona chahiye."
+                ) from None
             return None
 
         destination = payload.get("url")
