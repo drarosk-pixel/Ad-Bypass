@@ -182,12 +182,13 @@ class LinkResolver:
                 await self.start()
             try:
                 return await asyncio.wait_for(
-                    self._drive(url, log), timeout=self.timeout_seconds + 20
+                    self._drive(url, log, trace is not None),
+                    timeout=self.timeout_seconds + 20,
                 )
             except TimeoutError:
                 return ResolveResult("manual", url, "Resolve me zyada time lag gaya.")
 
-    async def _drive(self, url, log) -> ResolveResult:
+    async def _drive(self, url, log, verbose: bool) -> ResolveResult:
         assert self._browser is not None
         context = await self._browser.new_context(
             user_agent=DESKTOP_UA,
@@ -223,6 +224,9 @@ class LinkResolver:
             )
 
             await self._clear_cloudflare(page, log)
+
+            if verbose:
+                await self._dump_page(page, log, "after-load")
 
             # Read the countdown value from the page, if present.
             html = await self._content(page)
@@ -260,6 +264,8 @@ class LinkResolver:
                 await page.wait_for_timeout(1_500)
 
             # Deadline — decide why we failed.
+            if verbose:
+                await self._dump_page(page, log, "at-failure")
             if await self._interactive_captcha(page):
                 return ResolveResult(
                     "captcha",
@@ -272,6 +278,49 @@ class LinkResolver:
         finally:
             page.remove_listener("response", on_response)
             await context.close()
+
+    async def _dump_page(self, page: Page, log, label: str) -> None:
+        """Log a map of the page's clickable elements (diagnose mode only)."""
+        html = await self._content(page)
+        title = await self._title(page)
+        has_form = "go-link" in html
+        log(f"--- page map [{label}] ---")
+        log(f"   url  : {page.url}")
+        log(f"   title: {title}")
+        log(f"   html_len={len(html)}, form#go-link={'YES' if has_form else 'no'}")
+        try:
+            items = await page.evaluate(
+                """() => {
+                    const sel = 'a,button,input[type=submit],input[type=button]';
+                    const els = Array.from(document.querySelectorAll(sel)).slice(0, 40);
+                    return els.map(e => {
+                        const r = e.getBoundingClientRect();
+                        return {
+                            tag: e.tagName.toLowerCase(),
+                            id: e.id || '',
+                            cls: (e.className ? e.className.toString() : '').slice(0, 30),
+                            txt: (e.innerText || e.value || '').trim().slice(0, 35),
+                            href: e.getAttribute('href') || '',
+                            vis: r.width > 0 && r.height > 0,
+                        };
+                    });
+                }"""
+            )
+        except PlaywrightError:
+            items = []
+        shown = 0
+        for it in items:
+            if not (it.get("vis") or it.get("id") or it.get("href")):
+                continue
+            log(
+                f"   <{it['tag']} id='{it['id']}' cls='{it['cls']}' "
+                f"txt='{it['txt']}' href='{it['href']}' vis={it['vis']}>"
+            )
+            shown += 1
+            if shown >= 20:
+                break
+        if shown == 0:
+            log("   (no clickable elements found)")
 
     async def _clear_cloudflare(self, page: Page, log) -> None:
         """Wait for the Cloudflare 'Just a moment' interstitial to pass."""
