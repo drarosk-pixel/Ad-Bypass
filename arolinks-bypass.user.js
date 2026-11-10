@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AroLinks Fast-Skip
 // @namespace    https://github.com/drarosk-pixel/Ad-Bypass
-// @version      1.4.0
+// @version      1.5.0
 // @description  AroLinks + uske partner "step X/3" ad-gate pages par Open/Continue/Get-Link/Verify auto-click + countdown skip. CAPTCHA aapko khud solve karna hoga. Aapke apne browser me chalta hai.
 // @author       drarosk
 // @match        *://*/*
@@ -93,19 +93,13 @@
     return false;
   }
 
-  function revealButtons() {
-    var hidden = document.querySelectorAll(
-      '#btn6, .get-link, #get-link, #continue, .skip-btn, [id*="get-link"]'
-    );
-    for (var i = 0; i < hidden.length; i++) {
-      var b = hidden[i];
-      b.style.display = '';
-      b.hidden = false;
-      try {
-        b.disabled = false;
-      } catch (e) {}
-      b.classList && b.classList.remove('disabled');
-    }
+  // Final page = arolinks khud / go-link form / gt-link / koi visible captcha.
+  // In pages par script kuch click NAHI karegi (interference se chain restart
+  // hota tha). Sirf beech ke ad "step X/3" pages par auto-click.
+  function isFinalPage() {
+    if (/(^|\.)arolinks\.com$/i.test(location.hostname)) return true;
+    if (document.querySelector('form#go-link, a#gt-link')) return true;
+    return captchaWaiting();
   }
 
   function findDestination() {
@@ -178,18 +172,15 @@
           return;
         }
 
-        // Captcha dikhte hi script RUK jaata hai — koi click/reveal nahi.
-        // Warna captcha solve karke 'click here' dabane par background click
-        // poore chain ko shuru se restart kar deta hai.
-        if (captchaWaiting()) {
-          captchaSeen = true;
-        }
-        if (captchaSeen) {
-          setStatus("CAPTCHA page — aap khud solve karke 'click here' dabayein 🙏");
+        if (captchaWaiting()) captchaSeen = true;
+
+        // Final / CAPTCHA / go-link page par script RUK jaata hai — koi click
+        // nahi. Yahan AAP khud captcha solve karke 'click here' dabayein; sirf
+        // beech ke "step X/3" ad pages auto-skip hote hain.
+        if (captchaSeen || isFinalPage()) {
+          setStatus("final/CAPTCHA page — aap khud 'click here' dabayein 🙏");
           return;
         }
-
-        revealButtons();
 
         var btn = pickProceed();
         if (btn) {
