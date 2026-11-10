@@ -66,13 +66,13 @@ async def resolve_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("Message mein valid http:// ya https:// link bhejein.")
         return
 
-    status = await message.reply_text("Link resolve ho raha hai…")
+    status = await message.reply_text("Link resolve ho raha hai… (thoda wait karein)")
     resolver: LinkResolver = context.application.bot_data["resolver"]
 
     try:
         result = await resolver.resolve(match.group(0))
         await status.edit_text(
-            f"Final link:\n{result.final_url}\n\nMethod: {result.method}",
+            _format_result(result),
             disable_web_page_preview=True,
         )
     except ResolutionError as exc:
@@ -80,6 +80,24 @@ async def resolve_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception:
         LOGGER.exception("Unexpected resolution failure")
         await status.edit_text("Unexpected error aaya. Server logs check karein.")
+
+
+def _format_result(result) -> str:
+    if result.final:
+        return f"✅ Final link:\n{result.url}\n\nMethod: {result.method}"
+    if result.method == "captcha":
+        return (
+            "⚠️ Is link par CAPTCHA hai (bot ise solve nahi kar sakta).\n\n"
+            "Neeche wala page kholein, CAPTCHA + 'Continue'/'Get Link' khud daba kar "
+            "final link le lein:\n"
+            f"{result.url}\n\n"
+            "Note: Fresh browser me flow shuru se chal sakta hai."
+        )
+    return (
+        "⚠️ Automatic resolve poora nahi hua (countdown/ads/verification).\n\n"
+        "Yahan tak pohcha — ise kholkar baaki steps khud poore karein:\n"
+        f"{result.url}"
+    )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -107,7 +125,7 @@ def main() -> None:
     hosts = csv_set("ALLOWED_HOSTS", "arolinks.com,www.arolinks.com")
     resolver = LinkResolver(
         allowed_hosts=hosts,
-        timeout_seconds=float(os.getenv("RESOLVE_TIMEOUT_SECONDS", "50")),
+        timeout_seconds=float(os.getenv("RESOLVE_TIMEOUT_SECONDS", "75")),
         max_concurrent=int(os.getenv("MAX_CONCURRENT_RESOLUTIONS", "2")),
     )
 

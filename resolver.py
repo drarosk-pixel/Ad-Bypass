@@ -52,15 +52,18 @@ class ResolutionError(Exception):
 
 @dataclass(frozen=True)
 class ResolutionResult:
-    final_url: str
+    url: str
     method: str
+    # True  -> fully resolved final destination
+    # False -> intermediate page (CAPTCHA / manual step) for the user to continue
+    final: bool = True
 
 
 class LinkResolver:
     def __init__(
         self,
         allowed_hosts: set[str],
-        timeout_seconds: float = 50,
+        timeout_seconds: float = 75,
         max_concurrent: int = 2,
     ) -> None:
         self.allowed_hosts = {host.lower().rstrip(".") for host in allowed_hosts}
@@ -101,12 +104,13 @@ class LinkResolver:
                 await self.start()
             try:
                 return await asyncio.wait_for(
-                    self._resolve_browser(url), timeout=self.timeout_seconds
+                    self._resolve_browser(url),
+                    timeout=self.timeout_seconds + 15,
                 )
-            except TimeoutError as exc:
-                raise ResolutionError(
-                    "Link resolve karte waqt timeout ho gaya."
-                ) from exc
+            except TimeoutError:
+                # Hard safety net: hand back the entry URL so the user can
+                # at least open the flow and continue manually.
+                return ResolutionResult(url, "manual", final=False)
 
     @staticmethod
     def _normalize_url(raw_url: str) -> str:
@@ -242,25 +246,36 @@ class LinkResolver:
                 "button:has-text('Get Link')",
                 "a:has-text('Get Link')",
             ]
+            furthest_url = page.url
 
             while loop.time() < deadline:
+                # 1. Final URL discovered via a background JSON/API response.
                 while not discovered.empty():
                     candidate = await discovered.get()
                     accepted = await self._accept_candidate(candidate, page.url)
                     if accepted:
-                        return ResolutionResult(accepted, "shortener API")
+                        return ResolutionResult(accepted, "shortener API", final=True)
 
+                # 2. Browser navigated off the shortener -> that's the destination.
                 if page.url.startswith(
                     ("http://", "https://")
                 ) and not self._is_allowed_host(page.url):
                     await self._ensure_public_url(page.url)
-                    return ResolutionResult(page.url, "browser redirect")
+                    return ResolutionResult(page.url, "browser redirect", final=True)
 
-                page_html = await page.content()
+                furthest_url = page.url
+
+                # 3. Final URL embedded in the page markup/scripts.
+                page_html = await self._safe_content(page)
                 candidate = await self._candidate_from_text(page_html, page.url)
                 if candidate:
-                    return ResolutionResult(candidate, "page script")
+                    return ResolutionResult(candidate, "page script", final=True)
 
+                # 4. CAPTCHA reached -> hand this page to the user to solve.
+                if await self._captcha_visible(page):
+                    return ResolutionResult(page.url, "captcha", final=False)
+
+                # 5. Otherwise advance the ad/countdown flow by clicking.
                 clicked = False
                 for selector in selectors:
                     if selector in clicked_selectors:
@@ -282,18 +297,24 @@ class LinkResolver:
                 if clicked:
                     await page.wait_for_timeout(2_000)
                 else:
-                    await page.wait_for_timeout(1_000)
+                    # Wait out countdown timers; buttons may enable later.
+                    await page.wait_for_timeout(1_500)
 
+            # Deadline hit. Prefer a CAPTCHA page, else the furthest page reached,
+            # so the user can finish the remaining steps by hand.
             if await self._captcha_visible(page):
-                raise ResolutionError(
-                    "Is link par CAPTCHA hai. Bot CAPTCHA solve ya bypass nahi kar sakta."
-                )
-            raise ResolutionError(
-                "Final link nahi mila. Shortener ka page badal gaya ho sakta hai ya manual action chahiye."
-            )
+                return ResolutionResult(page.url, "captcha", final=False)
+            return ResolutionResult(furthest_url or start_url, "manual", final=False)
         finally:
             page.remove_listener("response", on_response)
             await context.close()
+
+    @staticmethod
+    async def _safe_content(page: Page) -> str:
+        try:
+            return await asyncio.wait_for(page.content(), timeout=5)
+        except (PlaywrightError, TimeoutError):
+            return ""
 
     async def _candidate_from_text(self, text: str, base_url: str) -> str | None:
         decoded = html.unescape(text)
@@ -352,8 +373,11 @@ class LinkResolver:
         selectors = [
             "iframe[src*='recaptcha']",
             "iframe[src*='hcaptcha']",
+            "iframe[src*='turnstile']",
+            "iframe[src*='challenges.cloudflare']",
             ".g-recaptcha",
             ".h-captcha",
+            ".cf-turnstile",
             "text=/verify you are human/i",
         ]
         for selector in selectors:

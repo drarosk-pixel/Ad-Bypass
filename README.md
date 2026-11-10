@@ -53,11 +53,17 @@ docker run --rm --env-file .env telegram-link-resolver
 | `TELEGRAM_BOT_TOKEN` | required | BotFather token |
 | `ALLOWED_HOSTS` | `arolinks.com,www.arolinks.com` | Accepted shortener hosts |
 | `ALLOWED_USER_IDS` | empty | Comma-separated Telegram IDs; empty allows everyone |
-| `RESOLVE_TIMEOUT_SECONDS` | `50` | Per-link browser timeout |
+| `RESOLVE_TIMEOUT_SECONDS` | `75` | Per-link browser timeout |
 | `MAX_CONCURRENT_RESOLUTIONS` | `2` | Concurrent browser jobs |
 
 Public deployment mein `ALLOWED_USER_IDS` set karna recommended hai, kyunki har resolution browser resources use kar sakta hai.
 
+## CAPTCHA / manual handoff
+
+Bot countdown aur "Continue"/"Get Link" steps automatically paar karne ki koshish karta hai. Agar beech me **CAPTCHA** aa jaye ya pura flow time par poora na ho, to bot error dene ke bajaye **jahan tak pohcha us page ka link** bhej deta hai. User us page ko kholkar CAPTCHA solve karke khud final link le sakta hai.
+
+> Note: Bot headless server par chalta hai; jab aap wahi page apne browser me kholenge to shortener ka flow fresh session me shuru se chal sakta hai.
+
 ## Limits
 
-Ad-shortener HTML aur selectors kabhi bhi badal sakte hain. Agar AroLinks apna flow badalta hai, `resolver.py` ke selector list ko update karna padega. CAPTCHA ya human verification wali links automatically resolve nahi hongi.
+Ad-shortener HTML aur selectors kabhi bhi badal sakte hain. Agar AroLinks apna flow badalta hai, `resolver.py` ke selector list ko update karna padega. CAPTCHA ya human verification bot automatically solve nahi karta — wo step user ko khud karna padega.
