@@ -119,6 +119,18 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     LOGGER.error("Telegram update failed", exc_info=context.error)
 
 
+async def post_init(application: Application) -> None:
+    resolver: LinkResolver = application.bot_data["resolver"]
+    await resolver.start()
+    LOGGER.info("Browser started")
+
+
+async def post_shutdown(application: Application) -> None:
+    resolver: LinkResolver = application.bot_data["resolver"]
+    await resolver.close()
+    LOGGER.info("Browser stopped")
+
+
 def main() -> None:
     load_dotenv()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -126,10 +138,16 @@ def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN set karein (.env.example dekhein).")
 
     resolver = LinkResolver(
-        timeout_seconds=float(os.getenv("RESOLVE_TIMEOUT_SECONDS", "60"))
+        timeout_seconds=float(os.getenv("RESOLVE_TIMEOUT_SECONDS", "90"))
     )
 
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     application.bot_data["resolver"] = resolver
     application.bot_data["allowed_user_ids"] = allowed_user_ids()
     application.add_handler(CommandHandler("start", start_command))

@@ -1,52 +1,62 @@
 # AroLinks Final-Link Bot
 
-Telegram bot jo `arolinks.com` short link ka **final destination** nikaalta hai —
-bina browser ke, pure HTTP se.
+Telegram bot jo `arolinks.com` short link ka **final destination** nikaalta hai.
 
 ## Kaise kaam karta hai
 
-AroLinks ek AdLinkFly-based shortener hai. Wo destination seedha nahi dikhata;
-pehle ek partner article chain (`techmint.in` → `onlinewish.in`) se guzarna
-padta hai. Bot wahi chain follow karta hai, phir `onlinewish.in` referer ke
-saath arolinks ko hit karta hai (timer/ad hat jaata hai) aur `form#go-link` ko
-`/links/go` par POST karke JSON me asli URL le leta hai.
+AroLinks ek AdLinkFly-based shortener hai jo **Cloudflare** ke peeche hai. Go-link
+page to khulta hai, par `/links/go` par Cloudflare ka "managed challenge" aata
+hai jo plain HTTP clients (requests/cloudscraper) **clear nahi kar paate**.
 
-> Flow public reference se liya gaya hai:
-> https://github.com/MeherMankar/FZBypassBot
-> (logic reimplemented; content rephrased for licensing compliance.)
+Isliye yeh bot ek **asli browser** (Playwright + headful Chromium, Xvfb ke andar)
+chalata hai:
+
+1. Short link kholta hai; Cloudflare ka JS challenge browser khud clear karta hai
+2. Countdown ka intezaar karta hai
+3. "Get Link"/"Continue" button click karta hai
+4. Page ki apni JS `/links/go` call karti hai; bot us response se **final URL**
+   capture kar leta hai (ya revealed anchor / off-site redirect se)
+
+> Approach un bypassers jaisa hai jo headful browser ko Xvfb me chalate hain,
+> kyunki plain headless ko Cloudflare pakad leta hai
+> (ref: https://github.com/nekodu/linkgate-bypass).
 
 ## Bot token
 
-1. Telegram me `@BotFather` kholein, `/newbot` bhejein, token copy karein.
-2. `.env.example` ko `.env` banayein aur token daalein:
-
 ```bash
-cp .env.example .env
+cp .env.example .env     # phir TELEGRAM_BOT_TOKEN daalein
 ```
 
-## Local run
-
-Python 3.11+ chahiye.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python bot.py
-```
-
-Bot ko link bhejein:
-
-```text
-https://arolinks.com/jFHPD
-```
-
-## Docker
+## Docker (recommended)
 
 ```bash
 docker build -t arolinks-bot .
 docker run --rm --env-file .env arolinks-bot
 ```
+
+Docker image Chromium + Xvfb set up karta hai; headful browser virtual display
+me chalta hai.
+
+## Local run (Linux + display/xvfb)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install --with-deps chromium
+xvfb-run -a python bot.py       # headful under xvfb
+```
+
+Display na ho to `.env` me `HEADLESS=true` set karein (Cloudflare ke against
+kam effective).
+
+## Commands
+
+| Command | Kaam |
+|---|---|
+| `/start` | Intro |
+| `/debug <link>` | Step-by-step resolve report (fail hone par bhejein) |
+| `<arolinks link>` | Final link nikaalta hai |
 
 ## Config
 
@@ -54,13 +64,14 @@ docker run --rm --env-file .env arolinks-bot
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | required | BotFather token |
 | `ALLOWED_USER_IDS` | empty | Comma-separated Telegram IDs; empty = sabko allowed |
-| `RESOLVE_TIMEOUT_SECONDS` | `60` | Resolve timeout |
+| `RESOLVE_TIMEOUT_SECONDS` | `90` | Resolve timeout |
+| `HEADLESS` | `false` | `true` only if no display/xvfb |
 
 ## Zaroori baatein
 
-- **CAPTCHA bot solve nahi karta.** Agar kisi link par CAPTCHA aaya, bot us
-  page ka link de dega taaki aap khud solve kar sakein. (Normal arolinks flow me
-  referer trick CAPTCHA se bacha deta hai.)
-- AroLinks / partner sites apna flow ya partner domains kabhi bhi badal sakte
-  hain. Aisa hua to `resolver.py` me chain steps / regex update karne padenge.
-- Yeh sirf `arolinks.com` ke liye bana hai.
+- Agar Cloudflare **interactive** challenge (checkbox/Turnstile) laga de, to
+  headless server se wo solve nahi hoga — bot us page ka link de dega, aap khud
+  kholkar solve karein. CAPTCHA bot solve nahi karta.
+- AdLinkFly/Cloudflare kabhi bhi apna flow badal sakte hain; aisa hua to
+  `resolver.py` ke selectors / logic update karne padenge.
+- Sirf `arolinks.com` ke liye.

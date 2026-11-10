@@ -1,31 +1,31 @@
-"""AroLinks (arolinks.com) final-link resolver.
+"""AroLinks (arolinks.com) final-link resolver — real-browser edition.
 
-AroLinks is an AdLinkFly-based shortener. The ad/countdown page never exposes
-the destination directly; the site first wants the visitor to pass through a
-"partner" article chain (techmint.in -> onlinewish.in). Once a request to the
-short link arrives with an ``onlinewish.in`` referer, AroLinks serves the
-timer-free variant whose ``form#go-link`` can be POSTed to ``/links/go`` to get
-the real URL as JSON.
+AroLinks is an AdLinkFly-based shortener sitting behind Cloudflare. The go-link
+page loads, but the follow-up ``/links/go`` request is protected by a Cloudflare
+"managed challenge" that plain HTTP clients (requests / cloudscraper) cannot
+clear. The reliable way through is a REAL browser that executes Cloudflare's JS
+challenge and then runs the page's own JavaScript flow (countdown -> click ->
+``/links/go`` -> destination).
 
-This module reimplements that documented flow with plain HTTP (requests +
-cloudscraper) run in a worker thread. No browser is needed.
+This module drives headful Chromium via Playwright (run under Xvfb in Docker),
+clears Cloudflare, waits out the countdown, clicks the continue/get-link
+control, and captures the destination from the ``/links/go`` response, a
+revealed anchor, or an off-site navigation.
 
-Flow derived from the public reference implementation:
-https://github.com/MeherMankar/FZBypassBot/blob/main/FZBypass/bypass/ddl.py
+If Cloudflare shows an INTERACTIVE challenge (checkbox / Turnstile) it cannot be
+solved on a headless server — the link is handed back for the user to open.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import os
 import re
-import time
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-import cloudscraper
-import requests
-from bs4 import BeautifulSoup
+from playwright.async_api import Browser, Page, Playwright, Response, async_playwright
+from playwright.async_api import Error as PlaywrightError
 
 AROLINKS_HOSTS = {"arolinks.com", "www.arolinks.com"}
 
@@ -34,22 +34,34 @@ DESKTOP_UA = (
     "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
 
-_JS_REDIRECT_RE = re.compile(
-    r"""(?:window|document)\.location(?:\.href)?\s*=\s*
-        ["']((?:https?:)?(?:\\?/\\?/|//)[^"']+)["']""",
-    re.IGNORECASE | re.VERBOSE,
-)
-_TECHMINT_RE = re.compile(
-    r'href=["\'](https://techmint\.in[^"\']+)["\']', re.IGNORECASE
-)
 _COUNTER_RE = re.compile(r'"counter_value"\s*:\s*(\d+)')
 
-_CAPTCHA_MARKERS = {
-    "reCAPTCHA": ("g-recaptcha", "www.google.com/recaptcha", "grecaptcha"),
-    "hCaptcha": ("h-captcha", "hcaptcha.com"),
-    "Cloudflare Turnstile": ("cf-turnstile",),
-    "Cloudflare challenge": ("challenges.cloudflare.com", "cf-chl", "cf_chl_opt"),
-}
+# Cloudflare interstitial / challenge fingerprints.
+_CF_MARKERS = ("just a moment", "challenge-platform", "cf-chl", "cf_chl_opt")
+
+# Buttons that advance the AdLinkFly flow after the countdown.
+_CONTINUE_SELECTORS = (
+    "#go-link button[type='submit']",
+    "#go-link input[type='submit']",
+    "button#btn6",
+    "#btn6",
+    "#get-link",
+    ".get-link",
+    "button:has-text('Get Link')",
+    "a:has-text('Get Link')",
+    "button:has-text('Continue')",
+    "a:has-text('Continue')",
+    "button:has-text('Click here')",
+    "a:has-text('Click here')",
+)
+
+# Interactive challenge widgets that need a human.
+_INTERACTIVE_CAPTCHA = (
+    "iframe[src*='challenges.cloudflare.com']",
+    ".cf-turnstile",
+    "iframe[src*='recaptcha/api2/bframe']",  # reCAPTCHA v2 image challenge
+    "iframe[src*='hcaptcha.com']",
+)
 
 
 class ResolveError(Exception):
@@ -58,8 +70,6 @@ class ResolveError(Exception):
 
 @dataclass
 class _Trace:
-    """Collects a human-readable, step-by-step report for /debug."""
-
     lines: list[str] = field(default_factory=list)
 
     def add(self, msg: str) -> None:
@@ -72,309 +82,257 @@ class _Trace:
 @dataclass(frozen=True)
 class ResolveResult:
     # "final"   -> url is the real destination
-    # "captcha" -> url is a page the user must open and solve a CAPTCHA on
-    # "manual"  -> url is the furthest page reached; user continues by hand
+    # "captcha" -> interactive challenge; user must open the page and solve it
+    # "manual"  -> furthest page reached; user continues by hand
     status: str
     url: str
     note: str = ""
 
 
-def _js_redirect(text: str) -> str | None:
-    match = _JS_REDIRECT_RE.search(text or "")
-    if not match:
-        return None
-    return match.group(1).replace("\\/", "/")
+def _host(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()
 
 
-def _captcha_markers(html: str) -> list[str]:
-    low = (html or "").lower()
-    found = []
-    for label, needles in _CAPTCHA_MARKERS.items():
-        if any(n in low for n in needles):
-            found.append(label)
-    return found
+def _is_arolinks(url: str) -> bool:
+    return _host(url) in AROLINKS_HOSTS
 
 
-def _page_title(html: str) -> str:
-    match = re.search(
-        r"<title[^>]*>(.*?)</title>", html or "", re.IGNORECASE | re.DOTALL
-    )
-    return match.group(1).strip()[:120] if match else "(no title)"
+def _looks_like_destination(url: str) -> bool:
+    return url.startswith(("http://", "https://")) and not _is_arolinks(url)
 
 
 class LinkResolver:
-    def __init__(self, timeout_seconds: float = 60) -> None:
+    def __init__(self, timeout_seconds: float = 90) -> None:
         self.timeout_seconds = timeout_seconds
+        self.headless = os.getenv("HEADLESS", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        if self._browser is not None:
+            return
+        self._playwright = await async_playwright().start()
+        self._browser = await self._launch()
+
+    async def _launch(self) -> Browser:
+        assert self._playwright is not None
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        try:
+            return await self._playwright.chromium.launch(
+                headless=self.headless, args=args
+            )
+        except PlaywrightError:
+            # No display available for headful -> fall back to headless.
+            return await self._playwright.chromium.launch(headless=True, args=args)
+
+    async def close(self) -> None:
+        if self._browser is not None:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            await self._playwright.stop()
+            self._playwright = None
 
     async def resolve(self, raw_url: str) -> ResolveResult:
-        url = self._check_host(self._normalize(raw_url))
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self._resolve_arolinks, url, None),
-                timeout=self.timeout_seconds + 20,
-            )
-        except TimeoutError:
-            return ResolveResult("manual", url, "Resolve me zyada time lag gaya.")
+        return await self._run(self._check(raw_url), None)
 
     async def diagnose(self, raw_url: str) -> str:
-        """Run the resolver with full step logging; return the report text."""
         trace = _Trace()
         try:
-            url = self._check_host(self._normalize(raw_url))
+            url = self._check(raw_url)
             trace.add(f"Input : {url}")
-            result = await asyncio.wait_for(
-                asyncio.to_thread(self._resolve_arolinks, url, trace),
-                timeout=self.timeout_seconds + 20,
-            )
+            result = await self._run(url, trace)
             trace.add(f"RESULT: status={result.status}")
             trace.add(f"        url={result.url}")
             if result.note:
                 trace.add(f"        note={result.note}")
-        except TimeoutError:
-            trace.add("RESULT: TIMEOUT")
         except ResolveError as exc:
             trace.add(f"RESULT: ERROR — {exc}")
         return trace.text()
 
     @staticmethod
-    def _normalize(raw_url: str) -> str:
+    def _check(raw_url: str) -> str:
         url = (raw_url or "").strip().strip("<>[](){}.,;!\"'")
         parsed = urlparse(url)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             raise ResolveError("Valid http:// ya https:// arolinks link bhejein.")
-        return url
-
-    @staticmethod
-    def _check_host(url: str) -> str:
-        host = (urlparse(url).hostname or "").lower()
-        if host not in AROLINKS_HOSTS:
+        if not _is_arolinks(url):
             raise ResolveError(
                 "Filhaal sirf arolinks.com ke links supported hain. "
-                f"(mila: {host or 'invalid'})"
+                f"(mila: {parsed.hostname})"
             )
         return url
 
-    # ------------------------------------------------------------------ #
-    # The actual AroLinks partner-chain bypass (synchronous, threaded).  #
-    # ------------------------------------------------------------------ #
-    def _resolve_arolinks(self, url: str, trace: _Trace | None) -> ResolveResult:
+    async def _run(self, url: str, trace: _Trace | None) -> ResolveResult:
         def log(msg: str) -> None:
             if trace is not None:
                 trace.add(msg)
 
-        code = url.rstrip("/").split("/")[-1]
-        session = requests.Session()
-        session.headers.update({"User-Agent": DESKTOP_UA})
-
-        # Step 1 — load the short link (sets ref/session cookies).
-        try:
-            r1 = session.get(url, timeout=15)
-        except requests.RequestException as exc:
-            raise ResolveError(f"arolinks khula nahi: {type(exc).__name__}") from exc
-        log(f"1) GET short link   -> HTTP {r1.status_code}, len={len(r1.text)}")
-        log(f"   title: {_page_title(r1.text)}")
-        if r1.status_code != 200:
-            raise ResolveError(f"arolinks ne HTTP {r1.status_code} diya.")
-
-        early = self._parse_final_page(r1.text, str(r1.url), session, trace, "step1")
-        if early is not None and early.status == "final":
-            log("   -> destination already present on first page")
-            return early
-
-        partner_match = _TECHMINT_RE.search(r1.text)
-        if partner_match:
-            log(f"2) techmint partner -> {partner_match.group(1)[:90]}")
-            self._walk_partner_chain(session, url, code, partner_match.group(1), trace)
-        else:
-            log("2) techmint partner -> NOT FOUND on first page")
-
-        # Final step — request the short link again with an onlinewish referer.
-        # IMPORTANT: keep using the SAME client (cloudscraper) for the follow-up
-        # POST, else /links/go lacks Cloudflare's cf_clearance cookie and returns
-        # a 403 "Just a moment" challenge.
-        final_html, final_url, via, client = self._fetch_final_page(session, url, trace)
-        log(f"3) final GET ({via}) -> len={len(final_html)}")
-        log(f"   title: {_page_title(final_html)}")
-
-        result = self._parse_final_page(final_html, final_url, client, trace, "final")
-        if result is not None:
-            return result
-
-        markers = _captcha_markers(final_html)
-        if markers:
-            log(f"   captcha markers: {', '.join(markers)}")
-            return ResolveResult(
-                "captcha",
-                final_url,
-                f"Page par: {', '.join(markers)}. Isse solve karke final link milega.",
-            )
-        log("   no go-link form, no gt-link, no captcha marker found")
-        return ResolveResult(
-            "manual",
-            final_url,
-            "Final link automatically nahi mila — page khud kholkar try karein.",
-        )
-
-    def _walk_partner_chain(
-        self,
-        session: requests.Session,
-        url: str,
-        code: str,
-        partner: str,
-        trace: _Trace | None,
-    ) -> None:
-        """Visit the techmint.in / onlinewish.in article chain. Best-effort."""
-
-        def log(msg: str) -> None:
-            if trace is not None:
-                trace.add(msg)
-
-        partner = partner.replace("&amp;", "&")
-        try:
-            r2 = session.get(partner, headers={"Referer": url}, timeout=30)
-            art1 = _js_redirect(r2.text)
-            log(f"   2a techmint landing HTTP {r2.status_code}, art1={bool(art1)}")
-            if art1:
-                session.get(art1, headers={"Referer": partner}, timeout=15)
-
-            r_rm = session.get(
-                "https://techmint.in/readmore/",
-                headers={"Referer": art1 or partner},
-                timeout=15,
-            )
-            tl2 = _js_redirect(r_rm.text) or (
-                "https://techmint.in/studyeducations/"
-                f"?educationsscholorships={code}&pgtr=10&st=2"
-            )
-
-            r3 = session.get(tl2, headers={"Referer": art1 or partner}, timeout=15)
-            art2 = _js_redirect(r3.text) or art1
-            if art2:
-                session.get(art2, headers={"Referer": tl2}, timeout=15)
-
-            ow1 = (
-                "https://onlinewish.in/studyblogs/educationsunivrsties/"
-                f"?univrsityinsurances={code}"
-            )
-            r4 = session.get(ow1, headers={"Referer": art2 or tl2}, timeout=15)
-            ow_art = _js_redirect(r4.text)
-            log(f"   2b onlinewish landing HTTP {r4.status_code}, art={bool(ow_art)}")
-            if ow_art:
-                session.get(ow_art, headers={"Referer": ow1}, timeout=15)
-
-            session.get(
-                "https://onlinewish.in/readmore/",
-                headers={"Referer": ow_art or ow1},
-                timeout=15,
-            )
-            log("   2c onlinewish session established")
-        except requests.RequestException as exc:
-            log(
-                f"   partner chain error: {type(exc).__name__} (best-effort, continuing)"
-            )
-
-    def _fetch_final_page(
-        self, session: requests.Session, url: str, trace: _Trace | None
-    ) -> tuple[str, str, str, object]:
-        headers = {"Referer": "https://onlinewish.in/", "User-Agent": DESKTOP_UA}
-        try:
-            scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False}
-            )
-            for cookie in session.cookies:
-                scraper.cookies.set(
-                    cookie.name,
-                    cookie.value,
-                    domain=cookie.domain or "arolinks.com",
-                )
-            resp = scraper.get(url, headers=headers, timeout=30)
-            return resp.text, str(resp.url), "cloudscraper", scraper
-        except Exception as exc:  # noqa: BLE001 - any cloudscraper failure -> fallback
-            if trace is not None:
-                trace.add(
-                    f"   cloudscraper failed: {type(exc).__name__}; using requests"
-                )
+        async with self._lock:
+            if self._browser is None:
+                await self.start()
             try:
-                resp = session.get(url, headers=headers, timeout=30)
-                return resp.text, str(resp.url), "requests-fallback", session
-            except requests.RequestException as rexc:
-                raise ResolveError(
-                    f"Final page fetch fail: {type(rexc).__name__}"
-                ) from rexc
+                return await asyncio.wait_for(
+                    self._drive(url, log), timeout=self.timeout_seconds + 20
+                )
+            except TimeoutError:
+                return ResolveResult("manual", url, "Resolve me zyada time lag gaya.")
 
-    def _parse_final_page(
-        self,
-        html: str,
-        page_url: str,
-        client: object,
-        trace: _Trace | None,
-        where: str,
-    ) -> ResolveResult | None:
-        def log(msg: str) -> None:
-            if trace is not None:
-                trace.add(msg)
-
-        if not html:
-            return None
-        soup = BeautifulSoup(html, "html.parser")
-
-        gt_link = soup.find(
-            "a", id="gt-link", href=lambda h: bool(h) and h.startswith("http")
+    async def _drive(self, url, log) -> ResolveResult:
+        assert self._browser is not None
+        context = await self._browser.new_context(
+            user_agent=DESKTOP_UA,
+            locale="en-US",
+            viewport={"width": 1280, "height": 800},
         )
-        if gt_link:
-            log(f"   [{where}] gt-link anchor FOUND")
-            return ResolveResult("final", gt_link["href"])
+        destinations: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
 
-        form = soup.select_one("form#go-link")
-        if not form:
-            log(f"   [{where}] no form#go-link")
-            return None
-        log(f"   [{where}] form#go-link FOUND -> POSTing")
+        async def on_response(resp: Response) -> None:
+            u = resp.url
+            if "links/go" not in u and "/ajax" not in u:
+                return
+            try:
+                ctype = (resp.headers or {}).get("content-type", "").lower()
+                body = await resp.text()
+            except PlaywrightError:
+                return
+            log(f"   xhr {resp.status} {u.split('?')[0]} :: {body[:120]}")
+            if "json" not in ctype and not body.strip().startswith("{"):
+                return
+            match = re.search(r'"url"\s*:\s*"(https?:[^"]+)"', body)
+            if match:
+                await destinations.put(("links/go", match.group(1).replace("\\/", "/")))
 
-        hidden = {
-            inp.get("name"): inp.get("value", "")
-            for inp in form.find_all("input")
-            if inp.get("name")
-        }
-        action = form.get("action") or "/links/go"
-        if not action.startswith("http"):
-            action = urljoin("https://arolinks.com", action)
-
-        counter_match = _COUNTER_RE.search(html)
-        counter = int(counter_match.group(1)) if counter_match else 0
-        if 0 < counter <= 90:
-            log(f"   [{where}] counter={counter}s, waiting")
-            time.sleep(counter + 1)
+        page = await context.new_page()
+        page.on("response", on_response)
 
         try:
-            r_go = client.post(
-                action,
-                data=hidden,
-                headers={
-                    "Referer": page_url,
-                    "Origin": "https://arolinks.com",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                },
-                timeout=20,
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=min(int(self.timeout_seconds * 1000), 45_000),
             )
-        except requests.RequestException as exc:
-            raise ResolveError(f"go-link POST fail: {type(exc).__name__}") from exc
 
-        log(
-            f"   [{where}] /links/go -> HTTP {r_go.status_code}, body={r_go.text[:150]}"
-        )
-        try:
-            payload = json.loads(r_go.text)
-        except (ValueError, TypeError):
-            if "just a moment" in r_go.text.lower():
-                raise ResolveError(
-                    "Cloudflare ne POST block kiya (cf_clearance missing). "
-                    "cloudscraper client POST ke liye use hona chahiye."
-                ) from None
-            return None
+            await self._clear_cloudflare(page, log)
 
-        destination = payload.get("url")
-        if destination:
-            return ResolveResult("final", destination)
+            # Read the countdown value from the page, if present.
+            html = await self._content(page)
+            counter_match = _COUNTER_RE.search(html)
+            counter = int(counter_match.group(1)) if counter_match else 0
+            log(f"   counter_value={counter}")
+            if 0 < counter <= 90:
+                await page.wait_for_timeout((counter + 2) * 1000)
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self.timeout_seconds
+            clicked: set[str] = set()
+
+            while loop.time() < deadline:
+                # 1. destination captured from a /links/go response
+                if not destinations.empty():
+                    _src, dest = await destinations.get()
+                    if _looks_like_destination(dest):
+                        log(f"   destination via {_src}: {dest}")
+                        return ResolveResult("final", dest)
+
+                # 2. browser navigated off arolinks
+                if _looks_like_destination(page.url):
+                    log(f"   navigated to destination: {page.url}")
+                    return ResolveResult("final", page.url)
+
+                # 3. revealed anchor (gt-link) carrying the destination
+                dest = await self._revealed_link(page)
+                if dest:
+                    log(f"   destination via anchor: {dest}")
+                    return ResolveResult("final", dest)
+
+                # 4. advance the flow by clicking a continue/get-link control
+                await self._click_continue(page, clicked, log)
+                await page.wait_for_timeout(1_500)
+
+            # Deadline — decide why we failed.
+            if await self._interactive_captcha(page):
+                return ResolveResult(
+                    "captcha",
+                    page.url,
+                    "Interactive challenge (Cloudflare/captcha) — khud kholkar solve karein.",
+                )
+            return ResolveResult(
+                "manual", page.url, "Final link automatically nahi mila."
+            )
+        finally:
+            page.remove_listener("response", on_response)
+            await context.close()
+
+    async def _clear_cloudflare(self, page: Page, log) -> None:
+        """Wait for the Cloudflare 'Just a moment' interstitial to pass."""
+        for _ in range(30):
+            title = (await self._title(page)).lower()
+            body = (await self._content(page)).lower()
+            if not any(m in title or m in body for m in _CF_MARKERS):
+                return
+            await page.wait_for_timeout(1_000)
+        log("   cloudflare interstitial did not clear in time")
+
+    async def _click_continue(self, page: Page, clicked: set[str], log) -> None:
+        for selector in _CONTINUE_SELECTORS:
+            if selector in clicked:
+                continue
+            try:
+                locator = page.locator(selector).first
+                if (
+                    await locator.count()
+                    and await locator.is_visible()
+                    and await locator.is_enabled()
+                ):
+                    await locator.click(timeout=3_000)
+                    clicked.add(selector)
+                    log(f"   clicked: {selector}")
+                    return
+            except PlaywrightError:
+                continue
+
+    async def _revealed_link(self, page: Page) -> str | None:
+        for selector in ("a#gt-link", "a.get-link[href^='http']", "#gt-link a"):
+            try:
+                locator = page.locator(selector).first
+                if await locator.count():
+                    href = await locator.get_attribute("href")
+                    if href and _looks_like_destination(href):
+                        return href
+            except PlaywrightError:
+                continue
         return None
+
+    async def _interactive_captcha(self, page: Page) -> bool:
+        for selector in _INTERACTIVE_CAPTCHA:
+            try:
+                locator = page.locator(selector).first
+                if await locator.count() and await locator.is_visible():
+                    return True
+            except PlaywrightError:
+                continue
+        return False
+
+    @staticmethod
+    async def _content(page: Page) -> str:
+        try:
+            return await asyncio.wait_for(page.content(), timeout=5)
+        except (PlaywrightError, TimeoutError):
+            return ""
+
+    @staticmethod
+    async def _title(page: Page) -> str:
+        try:
+            return await asyncio.wait_for(page.title(), timeout=5)
+        except (PlaywrightError, TimeoutError):
+            return ""
