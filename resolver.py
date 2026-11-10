@@ -20,7 +20,7 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 
 import cloudscraper
@@ -44,9 +44,29 @@ _TECHMINT_RE = re.compile(
 )
 _COUNTER_RE = re.compile(r'"counter_value"\s*:\s*(\d+)')
 
+_CAPTCHA_MARKERS = {
+    "reCAPTCHA": ("g-recaptcha", "www.google.com/recaptcha", "grecaptcha"),
+    "hCaptcha": ("h-captcha", "hcaptcha.com"),
+    "Cloudflare Turnstile": ("cf-turnstile",),
+    "Cloudflare challenge": ("challenges.cloudflare.com", "cf-chl", "cf_chl_opt"),
+}
+
 
 class ResolveError(Exception):
     """Raised when the link cannot be resolved."""
+
+
+@dataclass
+class _Trace:
+    """Collects a human-readable, step-by-step report for /debug."""
+
+    lines: list[str] = field(default_factory=list)
+
+    def add(self, msg: str) -> None:
+        self.lines.append(msg)
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
 
 
 @dataclass(frozen=True)
@@ -66,17 +86,20 @@ def _js_redirect(text: str) -> str | None:
     return match.group(1).replace("\\/", "/")
 
 
-def _has_captcha(html: str) -> bool:
-    needles = (
-        "g-recaptcha",
-        "h-captcha",
-        "cf-turnstile",
-        "challenges.cloudflare.com",
-        "www.google.com/recaptcha",
-        "hcaptcha.com",
-    )
+def _captcha_markers(html: str) -> list[str]:
     low = (html or "").lower()
-    return any(n in low for n in needles)
+    found = []
+    for label, needles in _CAPTCHA_MARKERS.items():
+        if any(n in low for n in needles):
+            found.append(label)
+    return found
+
+
+def _page_title(html: str) -> str:
+    match = re.search(
+        r"<title[^>]*>(.*?)</title>", html or "", re.IGNORECASE | re.DOTALL
+    )
+    return match.group(1).strip()[:120] if match else "(no title)"
 
 
 class LinkResolver:
@@ -84,20 +107,34 @@ class LinkResolver:
         self.timeout_seconds = timeout_seconds
 
     async def resolve(self, raw_url: str) -> ResolveResult:
-        url = self._normalize(raw_url)
-        host = (urlparse(url).hostname or "").lower()
-        if host not in AROLINKS_HOSTS:
-            raise ResolveError(
-                "Filhaal sirf arolinks.com ke links supported hain. "
-                f"(mila: {host or 'invalid'})"
-            )
+        url = self._check_host(self._normalize(raw_url))
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(self._resolve_arolinks, url),
+                asyncio.to_thread(self._resolve_arolinks, url, None),
                 timeout=self.timeout_seconds + 20,
             )
         except TimeoutError:
             return ResolveResult("manual", url, "Resolve me zyada time lag gaya.")
+
+    async def diagnose(self, raw_url: str) -> str:
+        """Run the resolver with full step logging; return the report text."""
+        trace = _Trace()
+        try:
+            url = self._check_host(self._normalize(raw_url))
+            trace.add(f"Input : {url}")
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self._resolve_arolinks, url, trace),
+                timeout=self.timeout_seconds + 20,
+            )
+            trace.add(f"RESULT: status={result.status}")
+            trace.add(f"        url={result.url}")
+            if result.note:
+                trace.add(f"        note={result.note}")
+        except TimeoutError:
+            trace.add("RESULT: TIMEOUT")
+        except ResolveError as exc:
+            trace.add(f"RESULT: ERROR — {exc}")
+        return trace.text()
 
     @staticmethod
     def _normalize(raw_url: str) -> str:
@@ -107,45 +144,68 @@ class LinkResolver:
             raise ResolveError("Valid http:// ya https:// arolinks link bhejein.")
         return url
 
+    @staticmethod
+    def _check_host(url: str) -> str:
+        host = (urlparse(url).hostname or "").lower()
+        if host not in AROLINKS_HOSTS:
+            raise ResolveError(
+                "Filhaal sirf arolinks.com ke links supported hain. "
+                f"(mila: {host or 'invalid'})"
+            )
+        return url
+
     # ------------------------------------------------------------------ #
     # The actual AroLinks partner-chain bypass (synchronous, threaded).  #
     # ------------------------------------------------------------------ #
-    def _resolve_arolinks(self, url: str) -> ResolveResult:
+    def _resolve_arolinks(self, url: str, trace: _Trace | None) -> ResolveResult:
+        def log(msg: str) -> None:
+            if trace is not None:
+                trace.add(msg)
+
         code = url.rstrip("/").split("/")[-1]
         session = requests.Session()
         session.headers.update({"User-Agent": DESKTOP_UA})
 
-        # Step 1 — load the short link; this sets the ref/session cookies and
-        # exposes the techmint.in partner URL.
+        # Step 1 — load the short link (sets ref/session cookies).
         try:
             r1 = session.get(url, timeout=15)
         except requests.RequestException as exc:
             raise ResolveError(f"arolinks khula nahi: {type(exc).__name__}") from exc
+        log(f"1) GET short link   -> HTTP {r1.status_code}, len={len(r1.text)}")
+        log(f"   title: {_page_title(r1.text)}")
         if r1.status_code != 200:
             raise ResolveError(f"arolinks ne HTTP {r1.status_code} diya.")
 
-        # If the page already exposes the destination, short-circuit.
-        early = self._parse_final_page(r1.text, str(r1.url), session)
+        early = self._parse_final_page(r1.text, str(r1.url), session, trace, "step1")
         if early is not None and early.status == "final":
+            log("   -> destination already present on first page")
             return early
 
         partner_match = _TECHMINT_RE.search(r1.text)
         if partner_match:
-            self._walk_partner_chain(session, url, code, partner_match.group(1))
+            log(f"2) techmint partner -> {partner_match.group(1)[:90]}")
+            self._walk_partner_chain(session, url, code, partner_match.group(1), trace)
+        else:
+            log("2) techmint partner -> NOT FOUND on first page")
 
-        # Final step — request the short link again with an onlinewish referer,
-        # via cloudscraper to clear the Cloudflare bot gate.
-        final_html, final_url = self._fetch_final_page(session, url)
-        result = self._parse_final_page(final_html, final_url, session)
+        # Final step — request the short link again with an onlinewish referer.
+        final_html, final_url, via = self._fetch_final_page(session, url, trace)
+        log(f"3) final GET ({via}) -> len={len(final_html)}")
+        log(f"   title: {_page_title(final_html)}")
+
+        result = self._parse_final_page(final_html, final_url, session, trace, "final")
         if result is not None:
             return result
 
-        if _has_captcha(final_html):
+        markers = _captcha_markers(final_html)
+        if markers:
+            log(f"   captcha markers: {', '.join(markers)}")
             return ResolveResult(
                 "captcha",
                 final_url,
-                "Page par CAPTCHA hai — use solve karke final link mil jayega.",
+                f"Page par: {', '.join(markers)}. Isse solve karke final link milega.",
             )
+        log("   no go-link form, no gt-link, no captcha marker found")
         return ResolveResult(
             "manual",
             final_url,
@@ -153,14 +213,24 @@ class LinkResolver:
         )
 
     def _walk_partner_chain(
-        self, session: requests.Session, url: str, code: str, partner: str
+        self,
+        session: requests.Session,
+        url: str,
+        code: str,
+        partner: str,
+        trace: _Trace | None,
     ) -> None:
-        """Visit the techmint.in / onlinewish.in article chain so AroLinks
-        later serves the timer-free page. Best-effort: failures are tolerated."""
+        """Visit the techmint.in / onlinewish.in article chain. Best-effort."""
+
+        def log(msg: str) -> None:
+            if trace is not None:
+                trace.add(msg)
+
         partner = partner.replace("&amp;", "&")
         try:
             r2 = session.get(partner, headers={"Referer": url}, timeout=30)
             art1 = _js_redirect(r2.text)
+            log(f"   2a techmint landing HTTP {r2.status_code}, art1={bool(art1)}")
             if art1:
                 session.get(art1, headers={"Referer": partner}, timeout=15)
 
@@ -185,6 +255,7 @@ class LinkResolver:
             )
             r4 = session.get(ow1, headers={"Referer": art2 or tl2}, timeout=15)
             ow_art = _js_redirect(r4.text)
+            log(f"   2b onlinewish landing HTTP {r4.status_code}, art={bool(ow_art)}")
             if ow_art:
                 session.get(ow_art, headers={"Referer": ow1}, timeout=15)
 
@@ -193,11 +264,15 @@ class LinkResolver:
                 headers={"Referer": ow_art or ow1},
                 timeout=15,
             )
-        except requests.RequestException:
-            # Partner chain is best-effort; the final fetch may still work.
-            return
+            log("   2c onlinewish session established")
+        except requests.RequestException as exc:
+            log(
+                f"   partner chain error: {type(exc).__name__} (best-effort, continuing)"
+            )
 
-    def _fetch_final_page(self, session: requests.Session, url: str) -> tuple[str, str]:
+    def _fetch_final_page(
+        self, session: requests.Session, url: str, trace: _Trace | None
+    ) -> tuple[str, str, str]:
         headers = {"Referer": "https://onlinewish.in/", "User-Agent": DESKTOP_UA}
         try:
             scraper = cloudscraper.create_scraper(
@@ -210,34 +285,48 @@ class LinkResolver:
                     domain=cookie.domain or "arolinks.com",
                 )
             resp = scraper.get(url, headers=headers, timeout=30)
-            return resp.text, str(resp.url)
-        except Exception:  # noqa: BLE001 - any cloudscraper failure -> fallback
-            # Fall back to the plain session if cloudscraper is unavailable.
+            return resp.text, str(resp.url), "cloudscraper"
+        except Exception as exc:  # noqa: BLE001 - any cloudscraper failure -> fallback
+            if trace is not None:
+                trace.add(
+                    f"   cloudscraper failed: {type(exc).__name__}; using requests"
+                )
             try:
                 resp = session.get(url, headers=headers, timeout=30)
-                return resp.text, str(resp.url)
-            except requests.RequestException as exc:
+                return resp.text, str(resp.url), "requests-fallback"
+            except requests.RequestException as rexc:
                 raise ResolveError(
-                    f"Final page fetch fail: {type(exc).__name__}"
-                ) from exc
+                    f"Final page fetch fail: {type(rexc).__name__}"
+                ) from rexc
 
     def _parse_final_page(
-        self, html: str, page_url: str, session: requests.Session
+        self,
+        html: str,
+        page_url: str,
+        session: requests.Session,
+        trace: _Trace | None,
+        where: str,
     ) -> ResolveResult | None:
+        def log(msg: str) -> None:
+            if trace is not None:
+                trace.add(msg)
+
         if not html:
             return None
         soup = BeautifulSoup(html, "html.parser")
 
-        # Fast path: a gt-link anchor already carries the destination.
         gt_link = soup.find(
             "a", id="gt-link", href=lambda h: bool(h) and h.startswith("http")
         )
         if gt_link:
+            log(f"   [{where}] gt-link anchor FOUND")
             return ResolveResult("final", gt_link["href"])
 
         form = soup.select_one("form#go-link")
         if not form:
+            log(f"   [{where}] no form#go-link")
             return None
+        log(f"   [{where}] form#go-link FOUND -> POSTing")
 
         hidden = {
             inp.get("name"): inp.get("value", "")
@@ -251,6 +340,7 @@ class LinkResolver:
         counter_match = _COUNTER_RE.search(html)
         counter = int(counter_match.group(1)) if counter_match else 0
         if 0 < counter <= 90:
+            log(f"   [{where}] counter={counter}s, waiting")
             time.sleep(counter + 1)
 
         try:
@@ -267,6 +357,9 @@ class LinkResolver:
         except requests.RequestException as exc:
             raise ResolveError(f"go-link POST fail: {type(exc).__name__}") from exc
 
+        log(
+            f"   [{where}] /links/go -> HTTP {r_go.status_code}, body={r_go.text[:150]}"
+        )
         try:
             payload = json.loads(r_go.text)
         except (ValueError, TypeError):

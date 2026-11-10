@@ -63,8 +63,33 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     await update.effective_message.reply_text(
         "AroLinks link bhejein, main final link nikalne ki koshish karunga.\n\n"
-        "Example:\nhttps://arolinks.com/jFHPD"
+        "Example:\nhttps://arolinks.com/jFHPD\n\n"
+        "Agar resolve na ho: /debug <link> bhejein — main step-by-step report dunga."
     )
+
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or not user_is_allowed(update, context):
+        return
+
+    match = URL_RE.search(message.text or "")
+    if not match:
+        await message.reply_text("Use karein: /debug https://arolinks.com/XXXX")
+        return
+
+    status = await message.reply_text("🔎 Diagnose ho raha hai…")
+    resolver: LinkResolver = context.application.bot_data["resolver"]
+    try:
+        report = await resolver.diagnose(match.group(0))
+    except Exception:
+        LOGGER.exception("Diagnose failed")
+        report = "Diagnose crash ho gaya — server logs dekhein."
+
+    report = report or "(empty report)"
+    if len(report) > 3800:
+        report = report[:3800] + "\n… (truncated)"
+    await status.edit_text(report, disable_web_page_preview=True)
 
 
 async def resolve_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -108,6 +133,7 @@ def main() -> None:
     application.bot_data["resolver"] = resolver
     application.bot_data["allowed_user_ids"] = allowed_user_ids()
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("debug", debug_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, resolve_message)
     )
