@@ -75,3 +75,41 @@ kam effective).
 - AdLinkFly/Cloudflare kabhi bhi apna flow badal sakte hain; aisa hua to
   `resolver.py` ke selectors / logic update karne padenge.
 - Sirf `arolinks.com` ke liye.
+
+---
+
+# AroLinks Fast-Skip — Userscript (recommended)
+
+Server bot ko AroLinks **anti-bot se block** karta hai. Isliye sabse reliable
+tareeka: ek **userscript** jo aapke apne browser me chale. Tab Cloudflare pass ho
+jaata hai (asli browser + asli session), aur script countdown skip + Continue/
+Get-Link auto-click kar deti hai. **CAPTCHA aapko khud solve karna hoga.**
+
+File: [`arolinks-bypass.user.js`](arolinks-bypass.user.js)
+
+## Install — Desktop (Chrome/Edge/Firefox/Brave)
+
+1. **Tampermonkey** extension install karein (ya Violentmonkey).
+2. Yeh raw link kholein — Tampermonkey khud "Install" dikhayega:
+   `https://github.com/drarosk-pixel/Ad-Bypass/raw/bot-implementation/arolinks-bypass.user.js`
+3. **Install** dabayein. Bas.
+
+## Install — Android
+
+1. **Kiwi Browser** ya **Firefox (Android)** install karein.
+2. Usme **Tampermonkey/Violentmonkey** add karein.
+3. Upar wala raw link kholkar userscript install karein.
+
+## Use
+
+- Koi bhi `arolinks.com` link apne browser me kholein.
+- Upar-right me `[AroLinks Skip]` badge dikhega. Script khud countdown skip karke
+  Continue/Get-Link dabati jaayegi.
+- CAPTCHA aaya to badge bolega *"CAPTCHA aaya — ise aap solve karein"* — solve
+  karte hi script aage badh kar final link par le jaayegi.
+
+## Note
+
+AroLinks / partner pages apna layout kabhi bhi badal sakte hain. Aisa hua to
+`arolinks-bypass.user.js` ke selectors (`BTN_ID_CLS`, `BTN_TXT`,
+`findDestination`) update karne padenge.
