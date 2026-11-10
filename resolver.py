@@ -1,427 +1,278 @@
+"""AroLinks (arolinks.com) final-link resolver.
+
+AroLinks is an AdLinkFly-based shortener. The ad/countdown page never exposes
+the destination directly; the site first wants the visitor to pass through a
+"partner" article chain (techmint.in -> onlinewish.in). Once a request to the
+short link arrives with an ``onlinewish.in`` referer, AroLinks serves the
+timer-free variant whose ``form#go-link`` can be POSTed to ``/links/go`` to get
+the real URL as JSON.
+
+This module reimplements that documented flow with plain HTTP (requests +
+cloudscraper) run in a worker thread. No browser is needed.
+
+Flow derived from the public reference implementation:
+https://github.com/MeherMankar/FZBypassBot/blob/main/FZBypass/bypass/ddl.py
+"""
+
 from __future__ import annotations
 
 import asyncio
-import html
-import ipaddress
+import json
 import re
-import socket
+import time
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
-import httpx
-from playwright.async_api import (
-    Browser,
-    Page,
-    Playwright,
-    Response,
-    Route,
-    async_playwright,
-)
-from playwright.async_api import Error as PlaywrightError
+import cloudscraper
+import requests
+from bs4 import BeautifulSoup
 
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-URL_KEYS = {
-    "url",
-    "destination",
-    "destination_url",
-    "final_url",
-    "original_url",
-    "redirect",
-}
-URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
-META_REFRESH_RE = re.compile(
-    r"<meta[^>]+http-equiv=[\"']?refresh[\"']?[^>]+content=[\"'][^\"']*url\s*=\s*([^\"']+)",
-    re.IGNORECASE,
-)
-JSON_URL_RE = re.compile(
-    r"[\"\'](?:destination|destination_url|final_url|original_url|redirect)[\"\']\s*:\s*[\"\'](https?:\\?/\\?/[^\"\']+)",
-    re.IGNORECASE,
-)
-LOCATION_RE = re.compile(
-    r"(?:window\.)?location(?:\.href)?\s*=\s*[\"'](https?://[^\"']+)",
-    re.IGNORECASE,
+AROLINKS_HOSTS = {"arolinks.com", "www.arolinks.com"}
+
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
 
+_JS_REDIRECT_RE = re.compile(
+    r"""(?:window|document)\.location(?:\.href)?\s*=\s*
+        ["']((?:https?:)?(?:\\?/\\?/|//)[^"']+)["']""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_TECHMINT_RE = re.compile(
+    r'href=["\'](https://techmint\.in[^"\']+)["\']', re.IGNORECASE
+)
+_COUNTER_RE = re.compile(r'"counter_value"\s*:\s*(\d+)')
 
-class ResolutionError(Exception):
-    """Raised when a link cannot be resolved safely."""
+
+class ResolveError(Exception):
+    """Raised when the link cannot be resolved."""
 
 
 @dataclass(frozen=True)
-class ResolutionResult:
+class ResolveResult:
+    # "final"   -> url is the real destination
+    # "captcha" -> url is a page the user must open and solve a CAPTCHA on
+    # "manual"  -> url is the furthest page reached; user continues by hand
+    status: str
     url: str
-    method: str
-    # True  -> fully resolved final destination
-    # False -> intermediate page (CAPTCHA / manual step) for the user to continue
-    final: bool = True
+    note: str = ""
+
+
+def _js_redirect(text: str) -> str | None:
+    match = _JS_REDIRECT_RE.search(text or "")
+    if not match:
+        return None
+    return match.group(1).replace("\\/", "/")
+
+
+def _has_captcha(html: str) -> bool:
+    needles = (
+        "g-recaptcha",
+        "h-captcha",
+        "cf-turnstile",
+        "challenges.cloudflare.com",
+        "www.google.com/recaptcha",
+        "hcaptcha.com",
+    )
+    low = (html or "").lower()
+    return any(n in low for n in needles)
 
 
 class LinkResolver:
-    def __init__(
-        self,
-        allowed_hosts: set[str],
-        timeout_seconds: float = 75,
-        max_concurrent: int = 2,
-    ) -> None:
-        self.allowed_hosts = {host.lower().rstrip(".") for host in allowed_hosts}
+    def __init__(self, timeout_seconds: float = 60) -> None:
         self.timeout_seconds = timeout_seconds
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = None
 
-    async def start(self) -> None:
-        if self._browser is not None:
-            return
-        playwright = await async_playwright().start()
-        self._playwright = playwright
-        self._browser = await playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-
-    async def close(self) -> None:
-        if self._browser is not None:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
-
-    async def resolve(self, raw_url: str) -> ResolutionResult:
-        url = self._normalize_url(raw_url)
-        self._ensure_allowed_initial_host(url)
-        await self._ensure_public_url(url)
-
-        async with self._semaphore:
-            direct_result = await self._resolve_http(url)
-            if direct_result is not None:
-                return direct_result
-
-            if self._browser is None:
-                await self.start()
-            try:
-                return await asyncio.wait_for(
-                    self._resolve_browser(url),
-                    timeout=self.timeout_seconds + 15,
-                )
-            except TimeoutError:
-                # Hard safety net: hand back the entry URL so the user can
-                # at least open the flow and continue manually.
-                return ResolutionResult(url, "manual", final=False)
+    async def resolve(self, raw_url: str) -> ResolveResult:
+        url = self._normalize(raw_url)
+        host = (urlparse(url).hostname or "").lower()
+        if host not in AROLINKS_HOSTS:
+            raise ResolveError(
+                "Filhaal sirf arolinks.com ke links supported hain. "
+                f"(mila: {host or 'invalid'})"
+            )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._resolve_arolinks, url),
+                timeout=self.timeout_seconds + 20,
+            )
+        except TimeoutError:
+            return ResolveResult("manual", url, "Resolve me zyada time lag gaya.")
 
     @staticmethod
-    def _normalize_url(raw_url: str) -> str:
-        url = raw_url.strip().strip('<>[](){}.,;!"')
+    def _normalize(raw_url: str) -> str:
+        url = (raw_url or "").strip().strip("<>[](){}.,;!\"'")
         parsed = urlparse(url)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-            raise ResolutionError("Sirf valid http:// ya https:// URL bhejein.")
-        if parsed.username or parsed.password:
-            raise ResolutionError("Username/password wala URL allowed nahi hai.")
+            raise ResolveError("Valid http:// ya https:// arolinks link bhejein.")
         return url
 
-    def _ensure_allowed_initial_host(self, url: str) -> None:
-        host = (urlparse(url).hostname or "").lower().rstrip(".")
-        if host not in self.allowed_hosts:
-            allowed = ", ".join(sorted(self.allowed_hosts))
-            raise ResolutionError(
-                f"Yeh bot filhaal sirf in hosts ko accept karta hai: {allowed}"
+    # ------------------------------------------------------------------ #
+    # The actual AroLinks partner-chain bypass (synchronous, threaded).  #
+    # ------------------------------------------------------------------ #
+    def _resolve_arolinks(self, url: str) -> ResolveResult:
+        code = url.rstrip("/").split("/")[-1]
+        session = requests.Session()
+        session.headers.update({"User-Agent": DESKTOP_UA})
+
+        # Step 1 — load the short link; this sets the ref/session cookies and
+        # exposes the techmint.in partner URL.
+        try:
+            r1 = session.get(url, timeout=15)
+        except requests.RequestException as exc:
+            raise ResolveError(f"arolinks khula nahi: {type(exc).__name__}") from exc
+        if r1.status_code != 200:
+            raise ResolveError(f"arolinks ne HTTP {r1.status_code} diya.")
+
+        # If the page already exposes the destination, short-circuit.
+        early = self._parse_final_page(r1.text, str(r1.url), session)
+        if early is not None and early.status == "final":
+            return early
+
+        partner_match = _TECHMINT_RE.search(r1.text)
+        if partner_match:
+            self._walk_partner_chain(session, url, code, partner_match.group(1))
+
+        # Final step — request the short link again with an onlinewish referer,
+        # via cloudscraper to clear the Cloudflare bot gate.
+        final_html, final_url = self._fetch_final_page(session, url)
+        result = self._parse_final_page(final_html, final_url, session)
+        if result is not None:
+            return result
+
+        if _has_captcha(final_html):
+            return ResolveResult(
+                "captcha",
+                final_url,
+                "Page par CAPTCHA hai — use solve karke final link mil jayega.",
+            )
+        return ResolveResult(
+            "manual",
+            final_url,
+            "Final link automatically nahi mila — page khud kholkar try karein.",
+        )
+
+    def _walk_partner_chain(
+        self, session: requests.Session, url: str, code: str, partner: str
+    ) -> None:
+        """Visit the techmint.in / onlinewish.in article chain so AroLinks
+        later serves the timer-free page. Best-effort: failures are tolerated."""
+        partner = partner.replace("&amp;", "&")
+        try:
+            r2 = session.get(partner, headers={"Referer": url}, timeout=30)
+            art1 = _js_redirect(r2.text)
+            if art1:
+                session.get(art1, headers={"Referer": partner}, timeout=15)
+
+            r_rm = session.get(
+                "https://techmint.in/readmore/",
+                headers={"Referer": art1 or partner},
+                timeout=15,
+            )
+            tl2 = _js_redirect(r_rm.text) or (
+                "https://techmint.in/studyeducations/"
+                f"?educationsscholorships={code}&pgtr=10&st=2"
             )
 
-    async def _resolve_http(self, start_url: str) -> ResolutionResult | None:
-        current = start_url
-        try:
-            async with httpx.AsyncClient(
-                follow_redirects=False,
-                timeout=httpx.Timeout(15.0),
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml",
-                },
-            ) as client:
-                for _ in range(10):
-                    await self._ensure_public_url(current)
-                    response = await client.get(current)
+            r3 = session.get(tl2, headers={"Referer": art1 or partner}, timeout=15)
+            art2 = _js_redirect(r3.text) or art1
+            if art2:
+                session.get(art2, headers={"Referer": tl2}, timeout=15)
 
-                    if response.is_redirect:
-                        location = response.headers.get("location")
-                        if not location:
-                            return None
-                        next_url = urljoin(current, location)
-                        if not self._is_allowed_host(next_url):
-                            await self._ensure_public_url(next_url)
-                            return ResolutionResult(next_url, "HTTP redirect")
-                        current = next_url
-                        continue
-
-                    if response.status_code >= 400:
-                        return None
-
-                    candidate = await self._candidate_from_text(response.text, current)
-                    if candidate:
-                        return ResolutionResult(candidate, "page metadata")
-                    return None
-        except (httpx.HTTPError, ResolutionError, UnicodeError):
-            return None
-
-        raise ResolutionError("Redirect chain bahut lambi hai.")
-
-    async def _resolve_browser(self, start_url: str) -> ResolutionResult:
-        assert self._browser is not None
-        context = await self._browser.new_context(
-            user_agent=USER_AGENT,
-            accept_downloads=False,
-            java_script_enabled=True,
-        )
-        dns_cache: dict[str, bool] = {}
-        discovered: asyncio.Queue[str] = asyncio.Queue()
-
-        async def route_guard(route: Route) -> None:
-            request_url = route.request.url
-            parsed = urlparse(request_url)
-            if parsed.scheme not in {"http", "https"}:
-                await route.continue_()
-                return
-
-            host = (parsed.hostname or "").lower().rstrip(".")
-            allowed = dns_cache.get(host)
-            if allowed is None:
-                try:
-                    await self._ensure_public_url(request_url)
-                    allowed = True
-                except ResolutionError:
-                    allowed = False
-                dns_cache[host] = allowed
-
-            if allowed:
-                await route.continue_()
-            else:
-                await route.abort("blockedbyclient")
-
-        await context.route("**/*", route_guard)
-        page = await context.new_page()
-
-        async def inspect_response(response: Response) -> None:
-            try:
-                if not self._is_allowed_host(response.url):
-                    return
-                content_type = (
-                    await response.header_value("content-type") or ""
-                ).lower()
-                if "json" not in content_type:
-                    return
-                data = await response.json()
-                candidate = self._url_from_json(data)
-                if candidate:
-                    await discovered.put(candidate)
-            except (PlaywrightError, TypeError, ValueError):
-                return
-
-        def on_response(response: Response) -> None:
-            asyncio.create_task(inspect_response(response))
-
-        page.on("response", on_response)
-
-        try:
-            await page.goto(
-                start_url,
-                wait_until="domcontentloaded",
-                timeout=min(int(self.timeout_seconds * 1000), 30_000),
+            ow1 = (
+                "https://onlinewish.in/studyblogs/educationsunivrsties/"
+                f"?univrsityinsurances={code}"
             )
+            r4 = session.get(ow1, headers={"Referer": art2 or tl2}, timeout=15)
+            ow_art = _js_redirect(r4.text)
+            if ow_art:
+                session.get(ow_art, headers={"Referer": ow1}, timeout=15)
 
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + self.timeout_seconds - 1
-            clicked_selectors: set[str] = set()
-            selectors = [
-                "form#go-link button[type='submit']",
-                "form#go-link input[type='submit']",
-                "#get-link",
-                "button.get-link",
-                "a.get-link",
-                "#continue",
-                "button:has-text('Continue')",
-                "a:has-text('Continue')",
-                "button:has-text('Get Link')",
-                "a:has-text('Get Link')",
-            ]
-            furthest_url = page.url
+            session.get(
+                "https://onlinewish.in/readmore/",
+                headers={"Referer": ow_art or ow1},
+                timeout=15,
+            )
+        except requests.RequestException:
+            # Partner chain is best-effort; the final fetch may still work.
+            return
 
-            while loop.time() < deadline:
-                # 1. Final URL discovered via a background JSON/API response.
-                while not discovered.empty():
-                    candidate = await discovered.get()
-                    accepted = await self._accept_candidate(candidate, page.url)
-                    if accepted:
-                        return ResolutionResult(accepted, "shortener API", final=True)
-
-                # 2. Browser navigated off the shortener -> that's the destination.
-                if page.url.startswith(
-                    ("http://", "https://")
-                ) and not self._is_allowed_host(page.url):
-                    await self._ensure_public_url(page.url)
-                    return ResolutionResult(page.url, "browser redirect", final=True)
-
-                furthest_url = page.url
-
-                # 3. Final URL embedded in the page markup/scripts.
-                page_html = await self._safe_content(page)
-                candidate = await self._candidate_from_text(page_html, page.url)
-                if candidate:
-                    return ResolutionResult(candidate, "page script", final=True)
-
-                # 4. CAPTCHA reached -> hand this page to the user to solve.
-                if await self._captcha_visible(page):
-                    return ResolutionResult(page.url, "captcha", final=False)
-
-                # 5. Otherwise advance the ad/countdown flow by clicking.
-                clicked = False
-                for selector in selectors:
-                    if selector in clicked_selectors:
-                        continue
-                    locator = page.locator(selector).first
-                    try:
-                        if (
-                            await locator.count()
-                            and await locator.is_visible()
-                            and await locator.is_enabled()
-                        ):
-                            await locator.click(timeout=3_000)
-                            clicked_selectors.add(selector)
-                            clicked = True
-                            break
-                    except PlaywrightError:
-                        continue
-
-                if clicked:
-                    await page.wait_for_timeout(2_000)
-                else:
-                    # Wait out countdown timers; buttons may enable later.
-                    await page.wait_for_timeout(1_500)
-
-            # Deadline hit. Prefer a CAPTCHA page, else the furthest page reached,
-            # so the user can finish the remaining steps by hand.
-            if await self._captcha_visible(page):
-                return ResolutionResult(page.url, "captcha", final=False)
-            return ResolutionResult(furthest_url or start_url, "manual", final=False)
-        finally:
-            page.remove_listener("response", on_response)
-            await context.close()
-
-    @staticmethod
-    async def _safe_content(page: Page) -> str:
+    def _fetch_final_page(self, session: requests.Session, url: str) -> tuple[str, str]:
+        headers = {"Referer": "https://onlinewish.in/", "User-Agent": DESKTOP_UA}
         try:
-            return await asyncio.wait_for(page.content(), timeout=5)
-        except (PlaywrightError, TimeoutError):
-            return ""
-
-    async def _candidate_from_text(self, text: str, base_url: str) -> str | None:
-        decoded = html.unescape(text)
-        raw_candidates: list[str] = []
-
-        meta_match = META_REFRESH_RE.search(decoded)
-        if meta_match:
-            raw_candidates.append(urljoin(base_url, meta_match.group(1).strip()))
-
-        raw_candidates.extend(
-            match.replace("\\/", "/") for match in JSON_URL_RE.findall(decoded)
-        )
-        raw_candidates.extend(LOCATION_RE.findall(decoded))
-
-        for candidate in raw_candidates:
-            accepted = await self._accept_candidate(candidate, base_url)
-            if accepted:
-                return accepted
-        return None
-
-    async def _accept_candidate(self, candidate: str, base_url: str) -> str | None:
-        candidate = html.unescape(candidate).replace("\\/", "/").strip()
-        candidate = urljoin(base_url, candidate)
-        parsed = urlparse(candidate)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return None
-        if self._is_allowed_host(candidate):
-            return None
-        try:
-            await self._ensure_public_url(candidate)
-        except ResolutionError:
-            return None
-        return candidate
-
-    @staticmethod
-    def _url_from_json(value: object) -> str | None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if (
-                    key.lower() in URL_KEYS
-                    and isinstance(item, str)
-                    and URL_RE.match(item)
-                ):
-                    return item
-                nested = LinkResolver._url_from_json(item)
-                if nested:
-                    return nested
-        elif isinstance(value, list):
-            for item in value:
-                nested = LinkResolver._url_from_json(item)
-                if nested:
-                    return nested
-        return None
-
-    async def _captcha_visible(self, page: Page) -> bool:
-        selectors = [
-            "iframe[src*='recaptcha']",
-            "iframe[src*='hcaptcha']",
-            "iframe[src*='turnstile']",
-            "iframe[src*='challenges.cloudflare']",
-            ".g-recaptcha",
-            ".h-captcha",
-            ".cf-turnstile",
-            "text=/verify you are human/i",
-        ]
-        for selector in selectors:
-            try:
-                locator = page.locator(selector).first
-                if await locator.count() and await locator.is_visible():
-                    return True
-            except PlaywrightError:
-                continue
-        return False
-
-    def _is_allowed_host(self, url: str) -> bool:
-        host = (urlparse(url).hostname or "").lower().rstrip(".")
-        return host in self.allowed_hosts
-
-    @staticmethod
-    async def _ensure_public_url(url: str) -> None:
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ResolutionError("Invalid URL.")
-        if parsed.username or parsed.password:
-            raise ResolutionError("Username/password wala URL allowed nahi hai.")
-        try:
-            port = parsed.port
-        except ValueError as exc:
-            raise ResolutionError("Invalid port.") from exc
-        if port is not None and port not in {80, 443}:
-            raise ResolutionError("Sirf standard web ports 80 aur 443 allowed hain.")
-
-        host = parsed.hostname.rstrip(".")
-        try:
-            direct_ip = ipaddress.ip_address(host)
-            addresses = [direct_ip]
-        except ValueError:
-            try:
-                infos = await asyncio.to_thread(
-                    socket.getaddrinfo,
-                    host,
-                    port or (443 if parsed.scheme == "https" else 80),
-                    type=socket.SOCK_STREAM,
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            for cookie in session.cookies:
+                scraper.cookies.set(
+                    cookie.name,
+                    cookie.value,
+                    domain=cookie.domain or "arolinks.com",
                 )
-            except socket.gaierror as exc:
-                raise ResolutionError("Domain resolve nahi hua.") from exc
-            addresses = [ipaddress.ip_address(info[4][0]) for info in infos]
+            resp = scraper.get(url, headers=headers, timeout=30)
+            return resp.text, str(resp.url)
+        except Exception:  # noqa: BLE001 - any cloudscraper failure -> fallback
+            # Fall back to the plain session if cloudscraper is unavailable.
+            try:
+                resp = session.get(url, headers=headers, timeout=30)
+                return resp.text, str(resp.url)
+            except requests.RequestException as exc:
+                raise ResolveError(
+                    f"Final page fetch fail: {type(exc).__name__}"
+                ) from exc
 
-        if not addresses or any(not address.is_global for address in addresses):
-            raise ResolutionError("Private ya local network URL allowed nahi hai.")
+    def _parse_final_page(
+        self, html: str, page_url: str, session: requests.Session
+    ) -> ResolveResult | None:
+        if not html:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Fast path: a gt-link anchor already carries the destination.
+        gt_link = soup.find(
+            "a", id="gt-link", href=lambda h: bool(h) and h.startswith("http")
+        )
+        if gt_link:
+            return ResolveResult("final", gt_link["href"])
+
+        form = soup.select_one("form#go-link")
+        if not form:
+            return None
+
+        hidden = {
+            inp.get("name"): inp.get("value", "")
+            for inp in form.find_all("input")
+            if inp.get("name")
+        }
+        action = form.get("action") or "/links/go"
+        if not action.startswith("http"):
+            action = urljoin("https://arolinks.com", action)
+
+        counter_match = _COUNTER_RE.search(html)
+        counter = int(counter_match.group(1)) if counter_match else 0
+        if 0 < counter <= 90:
+            time.sleep(counter + 1)
+
+        try:
+            r_go = session.post(
+                action,
+                data=hidden,
+                headers={
+                    "Referer": page_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "User-Agent": DESKTOP_UA,
+                },
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            raise ResolveError(f"go-link POST fail: {type(exc).__name__}") from exc
+
+        try:
+            payload = json.loads(r_go.text)
+        except (ValueError, TypeError):
+            return None
+
+        destination = payload.get("url")
+        if destination:
+            return ResolveResult("final", destination)
+        return None

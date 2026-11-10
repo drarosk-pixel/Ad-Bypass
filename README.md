@@ -1,27 +1,30 @@
-# Telegram Final-Link Resolver
+# AroLinks Final-Link Bot
 
-Telegram bot jo `arolinks.com` short links ke HTTP redirects, page metadata, aur normal browser flow ko follow karke final public URL deta hai.
+Telegram bot jo `arolinks.com` short link ka **final destination** nikaalta hai —
+bina browser ke, pure HTTP se.
 
-## Features
+## Kaise kaam karta hai
 
-- Fast HTTP redirect resolution, phir zarurat par headless Chromium fallback
-- AroLinks-style **Get Link / Continue** buttons aur JSON redirect responses ka support
-- SSRF protection: private/local IP addresses aur non-standard ports block hote hain
-- Default allowlist sirf `arolinks.com` ke liye
-- Optional Telegram user-ID allowlist
-- CAPTCHA detection; bot CAPTCHA solve ya bypass nahi karta
+AroLinks ek AdLinkFly-based shortener hai. Wo destination seedha nahi dikhata;
+pehle ek partner article chain (`techmint.in` → `onlinewish.in`) se guzarna
+padta hai. Bot wahi chain follow karta hai, phir `onlinewish.in` referer ke
+saath arolinks ko hit karta hai (timer/ad hat jaata hai) aur `form#go-link` ko
+`/links/go` par POST karke JSON me asli URL le leta hai.
+
+> Flow public reference se liya gaya hai:
+> https://github.com/MeherMankar/FZBypassBot
+> (logic reimplemented; content rephrased for licensing compliance.)
 
 ## Bot token
 
-1. Telegram mein `@BotFather` kholein.
-2. `/newbot` bhejein aur token copy karein.
-3. `.env.example` ko `.env` naam se copy karke token set karein.
+1. Telegram me `@BotFather` kholein, `/newbot` bhejein, token copy karein.
+2. `.env.example` ko `.env` banayein aur token daalein:
 
 ```bash
 cp .env.example .env
 ```
 
-## Local setup
+## Local run
 
 Python 3.11+ chahiye.
 
@@ -29,11 +32,10 @@ Python 3.11+ chahiye.
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-playwright install --with-deps chromium
 python bot.py
 ```
 
-Bot ko Telegram par `/start` bhejein, phir link paste karein:
+Bot ko link bhejein:
 
 ```text
 https://arolinks.com/jFHPD
@@ -42,28 +44,23 @@ https://arolinks.com/jFHPD
 ## Docker
 
 ```bash
-docker build -t telegram-link-resolver .
-docker run --rm --env-file .env telegram-link-resolver
+docker build -t arolinks-bot .
+docker run --rm --env-file .env arolinks-bot
 ```
 
-## Configuration
+## Config
 
-| Variable | Default | Purpose |
+| Variable | Default | Kaam |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | required | BotFather token |
-| `ALLOWED_HOSTS` | `arolinks.com,www.arolinks.com` | Accepted shortener hosts |
-| `ALLOWED_USER_IDS` | empty | Comma-separated Telegram IDs; empty allows everyone |
-| `RESOLVE_TIMEOUT_SECONDS` | `75` | Per-link browser timeout |
-| `MAX_CONCURRENT_RESOLUTIONS` | `2` | Concurrent browser jobs |
+| `ALLOWED_USER_IDS` | empty | Comma-separated Telegram IDs; empty = sabko allowed |
+| `RESOLVE_TIMEOUT_SECONDS` | `60` | Resolve timeout |
 
-Public deployment mein `ALLOWED_USER_IDS` set karna recommended hai, kyunki har resolution browser resources use kar sakta hai.
+## Zaroori baatein
 
-## CAPTCHA / manual handoff
-
-Bot countdown aur "Continue"/"Get Link" steps automatically paar karne ki koshish karta hai. Agar beech me **CAPTCHA** aa jaye ya pura flow time par poora na ho, to bot error dene ke bajaye **jahan tak pohcha us page ka link** bhej deta hai. User us page ko kholkar CAPTCHA solve karke khud final link le sakta hai.
-
-> Note: Bot headless server par chalta hai; jab aap wahi page apne browser me kholenge to shortener ka flow fresh session me shuru se chal sakta hai.
-
-## Limits
-
-Ad-shortener HTML aur selectors kabhi bhi badal sakte hain. Agar AroLinks apna flow badalta hai, `resolver.py` ke selector list ko update karna padega. CAPTCHA ya human verification bot automatically solve nahi karta — wo step user ko khud karna padega.
+- **CAPTCHA bot solve nahi karta.** Agar kisi link par CAPTCHA aaya, bot us
+  page ka link de dega taaki aap khud solve kar sakein. (Normal arolinks flow me
+  referer trick CAPTCHA se bacha deta hai.)
+- AroLinks / partner sites apna flow ya partner domains kabhi bhi badal sakte
+  hain. Aisa hua to `resolver.py` me chain steps / regex update karne padenge.
+- Yeh sirf `arolinks.com` ke liye bana hai.

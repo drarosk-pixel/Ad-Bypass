@@ -1,4 +1,9 @@
-FROM mcr.microsoft.com/playwright/python:v1.65.0-noble
+FROM python:3.12-slim
+
+# nodejs helps cloudscraper execute Cloudflare JS challenges when needed.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
