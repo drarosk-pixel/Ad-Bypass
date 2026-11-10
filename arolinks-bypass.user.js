@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AroLinks Fast-Skip
 // @namespace    https://github.com/drarosk-pixel/Ad-Bypass
-// @version      1.3.0
+// @version      1.4.0
 // @description  AroLinks + uske partner "step X/3" ad-gate pages par Open/Continue/Get-Link/Verify auto-click + countdown skip. CAPTCHA aapko khud solve karna hoga. Aapke apne browser me chalta hai.
 // @author       drarosk
 // @match        *://*/*
@@ -166,6 +166,7 @@
 
   function startWorker() {
     var ticks = 0;
+    var captchaSeen = false;
     var timer = setInterval(function () {
       ticks++;
       try {
@@ -177,12 +178,18 @@
           return;
         }
 
-        revealButtons();
-
+        // Captcha dikhte hi script RUK jaata hai — koi click/reveal nahi.
+        // Warna captcha solve karke 'click here' dabane par background click
+        // poore chain ko shuru se restart kar deta hai.
         if (captchaWaiting()) {
-          setStatus('CAPTCHA aaya — ise aap solve karein 🙏');
+          captchaSeen = true;
+        }
+        if (captchaSeen) {
+          setStatus("CAPTCHA page — aap khud solve karke 'click here' dabayein 🙏");
           return;
         }
+
+        revealButtons();
 
         var btn = pickProceed();
         if (btn) {
