@@ -1,10 +1,16 @@
 // ==UserScript==
 // @name         AroLinks Fast-Skip
 // @namespace    https://github.com/drarosk-pixel/Ad-Bypass
-// @version      2.0.0
+// @version      2.1.0
 // @description  AroLinks ad-gate chain (3-4 steps, pipefitter/techmint/onlinewish) auto-continue. Har page ka ad-timer PROPERLY wait karke aage badhta hai (isliye final link reset nahi hota). CAPTCHA aap khud solve karein. Aapke apne browser me chalta hai.
 // @author       drarosk
 // @match        *://*/*
+// @exclude      *://www.google.com/recaptcha/*
+// @exclude      *://recaptcha.net/*
+// @exclude      *://*.gstatic.com/*
+// @exclude      *://challenges.cloudflare.com/*
+// @exclude      *://*.hcaptcha.com/*
+// @exclude      *://hcaptcha.com/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -188,6 +194,23 @@
     badge.textContent = '[AroLinks] ' + msg;
   }
 
+  // Captcha/final page par sirf itna: final link reveal ho to wahan chale jao.
+  // Koi click/scroll/DOM-poke nahi — captcha ko bilkul chhoona nahi.
+  var watcherStarted = false;
+  function startDestinationWatcher() {
+    if (watcherStarted) return;
+    watcherStarted = true;
+    setInterval(function () {
+      try {
+        var dest = findDestination();
+        if (dest) {
+          setStatus('final link mila, ja rahe hain…');
+          location.href = dest;
+        }
+      } catch (e) {}
+    }, 2000);
+  }
+
   function startWorker() {
     var ticks = 0;
     var timer = setInterval(function () {
@@ -202,11 +225,15 @@
           return;
         }
 
-        // 2) CAPTCHA / final page -> script RUK jaata hai (reset se bachne ke
-        //    liye). Aap khud solve karke 'click here' dabayein.
+        // 2) CAPTCHA / final page -> script POORI tarah band ho jaata hai
+        //    (captcha ke beech koi interference na ho). Aap khud solve karke
+        //    'click here' dabayein. Ek halka watcher sirf final link detect
+        //    karta rahega (koi click nahi).
         if (captchaWaiting()) captchaSeen = true;
         if (captchaSeen || isFinalPage()) {
-          setStatus("final/CAPTCHA page — aap khud 'click here' dabayein 🙏");
+          setStatus("final/CAPTCHA page — aap khud solve karke 'click here' dabayein 🙏");
+          clearInterval(timer);
+          startDestinationWatcher();
           return;
         }
 
