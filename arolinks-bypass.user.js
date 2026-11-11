@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AroLinks Fast-Skip
 // @namespace    https://github.com/drarosk-pixel/Ad-Bypass
-// @version      1.6.0
-// @description  AroLinks + uske partner "step X/3" ad-gate pages par Open/Continue/Get-Link/Verify auto-click + countdown skip. CAPTCHA aapko khud solve karna hoga. Aapke apne browser me chalta hai.
+// @version      2.0.0
+// @description  AroLinks ad-gate chain (3-4 steps, pipefitter/techmint/onlinewish) auto-continue. Har page ka ad-timer PROPERLY wait karke aage badhta hai (isliye final link reset nahi hota). CAPTCHA aap khud solve karein. Aapke apne browser me chalta hai.
 // @author       drarosk
 // @match        *://*/*
 // @run-at       document-idle
@@ -10,19 +10,20 @@
 // ==/UserScript==
 
 /*
- * v1.1.0 wala stable behaviour + 2nd page ("click to verify" + countdown) ki fix.
+ * DESIGN — "patience", not "force-skip"
+ * -------------------------------------
+ * Ye ad-gates SERVER-SIDE check karte hain ki aapne page ka countdown poora
+ * ruke ya nahi. Agar script countdown ko force-skip karke button jaldi daba de,
+ * to site poore chain ko STEP 1 par RESET kar deti hai (yahi "final link pe
+ * wapas pehle page" wali dikkat thi).
  *
- * Active sirf tab hoti hai jab hostname AroLinks chain ka ho YA page par
- * "step X/3" / "currently on step" marker ho. Normal sites par kuch nahi karti.
- *
- * Active hone par har ~1.2s me:
- *   1. Chhupe hue get-link buttons dikhati/enable karti hai (countdown skip).
- *   2. Sabse PROMINENT (bada) proceed button click karti hai — "Open /
- *      Continue / Get Link / click to verify". Chhote ad buttons aur naye-tab
- *      wale ad links chhod deti hai. Disabled/countdown button ka WAIT karti
- *      hai aur enable hote hi click karti hai.
- *   3. Final destination link milte hi seedha wahan bhejti hai.
- *   4. CAPTCHA dikhe to ruk jaati hai — wo aap solve karein.
+ * Isliye ye script:
+ *   - Kisi button ko force-enable NAHI karta.
+ *   - Har page par countdown / "wait N seconds" ko POORA wait karta hai.
+ *   - Sirf tab click karta hai jab site KHUD button enable + visible kare.
+ *   - Jitne bhi steps hon (3/4/5), har naye page par ye dobara chalta hai.
+ *   - CAPTCHA ya final/go-link page par RUK jaata hai — wahan aap khud solve
+ *     karke 'click here' dabayein (koi interference nahi).
  */
 
 (function () {
@@ -34,10 +35,12 @@
 
   var BTN_ID_CLS =
     /(get-link|gt-link|btn6|get_link|continue|readmore|skip-btn|proceed|next-btn|open-btn|verify-btn)/i;
-  // Anchored — poora button text in phrases me se hona chahiye (ads nahi).
+  // Anchored: poora button text in phrases me se ho (ads match na hon).
   var PROCEED_TXT =
-    /^\s*(open|next|continue|proceed|get\s*link|click\s*here|read\s*more|readmore|skip|verify|go\s*to\s*link|click\s*to\s*verify|click\s*to\s*continue|verify\s*(?:&|and)?\s*continue)\s*>?\s*$/i;
-  var COUNTDOWN_TXT = /^\s*\d+\s*(seconds?|sec|s)\s*$/i;
+    /^\s*(open|next|continue|proceed|get\s*link|get\s*your\s*link|click\s*here|read\s*more|readmore|skip|verify|go\s*to\s*link|click\s*to\s*verify|click\s*to\s*continue|verify\s*(?:&|and)?\s*continue)\s*>?\s*$/i;
+  // Visible countdown element (unit zaroori: "8 seconds" / "7 sec").
+  var COUNTDOWN_TXT = /^\s*\d{1,3}\s*(seconds?|sec)\s*$/i;
+  var WAIT_TEXT = /wait\s*(\d{1,3})\s*second/i;
 
   var CAPTCHA_SEL = [
     "iframe[src*='challenges.cloudflare.com']",
@@ -47,7 +50,14 @@
     "iframe[src*='hcaptcha.com']",
   ];
 
+  var MIN_DWELL_MS = 6000; // har page par kam se kam itna ruko
+  var CLICK_PAUSE_MS = 3500; // click ke baad thodi der koi click nahi
+  var MAX_TICKS = 360; // ~6 min (1s tick) — 4-5 steps ke liye kaafi
+
+  var pageStart = Date.now();
+  var lastClickAt = 0;
   var lastClick = new WeakMap();
+  var captchaSeen = false;
   var badge = null;
 
   function hostIsChain() {
@@ -93,19 +103,10 @@
     return false;
   }
 
-  function revealButtons() {
-    var hidden = document.querySelectorAll(
-      '#btn6, .get-link, #get-link, #continue, .skip-btn, [id*="get-link"]'
-    );
-    for (var i = 0; i < hidden.length; i++) {
-      var b = hidden[i];
-      b.style.display = '';
-      b.hidden = false;
-      try {
-        b.disabled = false;
-      } catch (e) {}
-      b.classList && b.classList.remove('disabled');
-    }
+  // Final page = arolinks khud / go-link form / gt-link. Yahan click nahi.
+  function isFinalPage() {
+    if (/(^|\.)arolinks\.com$/i.test(location.hostname)) return true;
+    return !!document.querySelector('form#go-link, a#gt-link');
   }
 
   function findDestination() {
@@ -116,7 +117,30 @@
     return null;
   }
 
-  // Sabse bada (prominent) proceed button chuno — disabled/countdown skip.
+  // Koi visible countdown timer chal raha hai?
+  function countdownRunning() {
+    var els = document.querySelectorAll(
+      'span, div, p, b, strong, small, button, a, td, h1, h2, h3, h4'
+    );
+    for (var i = 0; i < els.length; i++) {
+      var e = els[i];
+      if (!visible(e)) continue;
+      if (e.children && e.children.length > 0) continue; // sirf leaf text
+      var txt = (e.innerText || e.textContent || '').trim();
+      if (COUNTDOWN_TXT.test(txt)) return true;
+    }
+    return false;
+  }
+
+  // Page ka required wait (ms) — "wait N seconds" text ya default dwell.
+  function requiredWaitMs() {
+    var t = (document.body && document.body.innerText) || '';
+    var m = WAIT_TEXT.exec(t);
+    if (m) return Math.min(parseInt(m[1], 10), 60) * 1000;
+    return MIN_DWELL_MS;
+  }
+
+  // Sabse prominent (bada) proceed button — enabled + visible, countdown nahi.
   function pickProceed() {
     var els = document.querySelectorAll(
       "a, button, input[type='submit'], input[type='button']"
@@ -137,10 +161,10 @@
       var txtMatch = PROCEED_TXT.test(txt);
       if (!idClsMatch && !txtMatch) continue;
 
+      // Text-only match + naya tab => sambhavit ad, chhod do.
       if (!idClsMatch && e.tagName === 'A' && e.target === '_blank') continue;
 
-      // Cooldown: disabled->enable ka wait; same button spam na ho.
-      if (now - (lastClick.get(e) || 0) < 2500) continue;
+      if (now - (lastClick.get(e) || 0) < 4000) continue; // same button cooldown
 
       var r = e.getBoundingClientRect();
       var area = r.width * r.height;
@@ -158,18 +182,18 @@
       badge.style.cssText =
         'position:fixed;top:8px;right:8px;z-index:2147483647;' +
         'background:#111;color:#0f0;font:12px monospace;padding:6px 10px;' +
-        'border-radius:6px;opacity:.9;max-width:70vw;pointer-events:none';
+        'border-radius:6px;opacity:.92;max-width:72vw;pointer-events:none';
       (document.body || document.documentElement).appendChild(badge);
     }
-    badge.textContent = '[AroLinks Skip] ' + msg;
+    badge.textContent = '[AroLinks] ' + msg;
   }
 
   function startWorker() {
     var ticks = 0;
-    var captchaSeen = false;
     var timer = setInterval(function () {
       ticks++;
       try {
+        // 1) Final destination mil gaya -> seedha wahan.
         var dest = findDestination();
         if (dest) {
           setStatus('final link mila, ja rahe hain…');
@@ -178,39 +202,53 @@
           return;
         }
 
-        // Captcha dikhte hi script RUK jaata hai — koi click/reveal nahi.
-        // Warna captcha solve karke 'click here' dabane par background click
-        // poore chain ko shuru se restart kar deta hai.
-        if (captchaWaiting()) {
-          captchaSeen = true;
-        }
-        if (captchaSeen) {
-          setStatus("CAPTCHA page — aap khud solve karke 'click here' dabayein 🙏");
+        // 2) CAPTCHA / final page -> script RUK jaata hai (reset se bachne ke
+        //    liye). Aap khud solve karke 'click here' dabayein.
+        if (captchaWaiting()) captchaSeen = true;
+        if (captchaSeen || isFinalPage()) {
+          setStatus("final/CAPTCHA page — aap khud 'click here' dabayein 🙏");
           return;
         }
 
-        revealButtons();
+        // 3) Ad-timer POORA wait karo (warna chain reset ho jaata hai).
+        var elapsed = Date.now() - pageStart;
+        var need = requiredWaitMs();
+        if (countdownRunning() || elapsed < need) {
+          var left = Math.max(0, Math.ceil((need - elapsed) / 1000));
+          setStatus('ad timer wait… ' + (countdownRunning() ? '(countdown)' : left + 's'));
+          return;
+        }
 
+        // 4) Click ke turant baad dobara click na karo.
+        if (Date.now() - lastClickAt < CLICK_PAUSE_MS) {
+          setStatus('aage badh rahe hain…');
+          return;
+        }
+
+        // 5) Prominent proceed button click karo.
         var btn = pickProceed();
         if (btn) {
           lastClick.set(btn, Date.now());
+          lastClickAt = Date.now();
           var label = (btn.innerText || btn.value || btn.id || '').trim();
           setStatus('clicking: ' + label.slice(0, 24));
           try {
             btn.click();
           } catch (e) {}
+        } else if (elapsed > 25000) {
+          setStatus('button nahi mila — ek baar koi image/ad tap karein 👆');
         } else {
-          setStatus('wait… (' + ticks + ')');
+          setStatus('button ka wait…');
         }
       } catch (e) {
         /* keep going */
       }
 
-      if (ticks > 150) {
+      if (ticks > MAX_TICKS) {
         setStatus('ruk gaya — manually continue karein');
         clearInterval(timer);
       }
-    }, 1200);
+    }, 1000);
   }
 
   if (isActive()) {
