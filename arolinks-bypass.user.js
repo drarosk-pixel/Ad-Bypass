@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         AroLinks Fast-Skip
 // @namespace    https://github.com/drarosk-pixel/Ad-Bypass
-// @version      2.1.0
-// @description  AroLinks ad-gate chain (3-4 steps, pipefitter/techmint/onlinewish) auto-continue. Har page ka ad-timer PROPERLY wait karke aage badhta hai (isliye final link reset nahi hota). CAPTCHA aap khud solve karein. Aapke apne browser me chalta hai.
+// @version      2.2.0
+// @description  AroLinks ad-gate chain (3-4 steps, pipefitter/techmint/onlinewish) auto-continue. Har page ka ad-timer PROPERLY wait karke aage badhta hai. Proceed button ko khud CLICK NAHI karta (programmatic click isTrusted=false hota hai, jo captcha/step-reset detection trigger kar sakta hai) — button ko highlight karta hai, aap REAL tap karein. CAPTCHA aap khud solve karein. Aapke apne browser me chalta hai.
 // @author       drarosk
 // @match        *://*/*
 // @exclude      *://www.google.com/recaptcha/*
@@ -30,6 +30,19 @@
  *   - Jitne bhi steps hon (3/4/5), har naye page par ye dobara chalta hai.
  *   - CAPTCHA ya final/go-link page par RUK jaata hai — wahan aap khud solve
  *     karke 'click here' dabayein (koi interference nahi).
+ *
+ * WHY NO AUTO-CLICK (v2.2)
+ * ------------------------
+ * `element.click()` se chalaya gaya click hamesha `event.isTrusted === false`
+ * hota hai — koi bhi script browser se "real click" fake nahi kar sakta, ye
+ * browser ki hard security guarantee hai. Agar poore chain me koi real click
+ * nahi hua (sirf script ne click kiya), to session ka interaction history
+ * khaali rehta hai. Isse do dikkat aati hain: (1) end ka CAPTCHA widget kam
+ * "trust" ke saath load hota hai aur verify hone me atakta/fail hota hai,
+ * (2) chain apna khud ka step-validation bhi reset kar sakta hai, bhale hi
+ * CAPTCHA upar se "solved" dikhe. Isliye ab script sirf button HIGHLIGHT karta
+ * hai aur aapke REAL tap ka wait karta hai — wait/countdown wala hissa
+ * (jahan trust ka sawal nahi) ab bhi fully automatic hai.
  */
 
 (function () {
@@ -65,6 +78,8 @@
   var lastClick = new WeakMap();
   var captchaSeen = false;
   var badge = null;
+  var armedBtn = null;
+  var armedHandler = null;
 
   function hostIsChain() {
     return CHAIN_HOSTS.test(location.hostname);
@@ -182,6 +197,42 @@
     return best;
   }
 
+  // Button ko unarm karo: highlight hatao, listener hatao.
+  function disarm() {
+    if (armedBtn && armedHandler) {
+      try {
+        armedBtn.removeEventListener('click', armedHandler, true);
+      } catch (e) {}
+    }
+    if (armedBtn) {
+      armedBtn.style.outline = '';
+      armedBtn.style.boxShadow = '';
+    }
+    armedBtn = null;
+    armedHandler = null;
+  }
+
+  // Button ko highlight karke REAL (isTrusted) click ka wait karo.
+  // Script khud .click() NAHI karta — real tap zaroori hai (dekhein header
+  // comment "WHY NO AUTO-CLICK").
+  function armButton(btn) {
+    if (armedBtn === btn) return; // already armed, dobara mat chedo
+    disarm();
+    armedBtn = btn;
+    btn.style.outline = '3px solid #0f0';
+    btn.style.boxShadow = '0 0 14px 4px rgba(0,255,0,.85)';
+    try {
+      btn.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    } catch (e) {}
+    armedHandler = function (e) {
+      if (!e.isTrusted) return; // sirf real tap ginte hain
+      lastClick.set(btn, Date.now());
+      lastClickAt = Date.now();
+      disarm();
+    };
+    btn.addEventListener('click', armedHandler, true);
+  }
+
   function setStatus(msg) {
     if (!badge) {
       badge = document.createElement('div');
@@ -231,6 +282,7 @@
         //    karta rahega (koi click nahi).
         if (captchaWaiting()) captchaSeen = true;
         if (captchaSeen || isFinalPage()) {
+          disarm();
           setStatus("final/CAPTCHA page — aap khud solve karke 'click here' dabayein 🙏");
           clearInterval(timer);
           startDestinationWatcher();
@@ -246,26 +298,26 @@
           return;
         }
 
-        // 4) Click ke turant baad dobara click na karo.
+        // 4) Real click ke turant baad thoda ruko (naya page load ho raha hai).
         if (Date.now() - lastClickAt < CLICK_PAUSE_MS) {
+          disarm();
           setStatus('aage badh rahe hain…');
           return;
         }
 
-        // 5) Prominent proceed button click karo.
+        // 5) Prominent proceed button HIGHLIGHT karo — click aap khud karein.
         var btn = pickProceed();
         if (btn) {
-          lastClick.set(btn, Date.now());
-          lastClickAt = Date.now();
+          armButton(btn);
           var label = (btn.innerText || btn.value || btn.id || '').trim();
-          setStatus('clicking: ' + label.slice(0, 24));
-          try {
-            btn.click();
-          } catch (e) {}
-        } else if (elapsed > 25000) {
-          setStatus('button nahi mila — ek baar koi image/ad tap karein 👆');
+          setStatus('👉 TAP karein: ' + label.slice(0, 24));
         } else {
-          setStatus('button ka wait…');
+          disarm();
+          if (elapsed > 25000) {
+            setStatus('button nahi mila — ek baar koi image/ad tap karein 👆');
+          } else {
+            setStatus('button ka wait…');
+          }
         }
       } catch (e) {
         /* keep going */
